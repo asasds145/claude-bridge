@@ -1,0 +1,37 @@
+{
+  // Replace the placeholders below before deploying. Secrets go in via `wrangler secret put`, never here.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "chief-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-15",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [{ "name": "QUEUE", "class_name": "BoxmcpQueue" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BoxmcpQueue"] }],
+  "kv_namespaces": [
+    // `npx wrangler kv namespace create OAUTH_KV` and paste the id here
+    { "binding": "OAUTH_KV", "id": "<YOUR_KV_NAMESPACE_ID>" }
+  ],
+  "vars": {
+    // Numeric GitHub user id of the only account allowed to authorize (https://api.github.com/users/<login> -> "id")
+    "BOXMCP_OWNER_GITHUB_ID": "0",
+    // Client ID of your GitHub OAuth app (callback URL: https://<your-worker-host>/callback)
+    "GITHUB_CLIENT_ID": "",
+    "CHIEF_WEBHOOK_AUTH_HEADER": "Authorization",
+    "CHIEF_WEBHOOK_AUTH_SCHEME": "Bearer",
+    // Public https origin of the worker, e.g. https://chief-bridge.<your-subdomain>.workers.dev
+    // Empty = use the request origin.
+    "BOXMCP_PUBLIC_ORIGIN": ""
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "enabled": true, "invocation_logs": true, "head_sampling_rate": 1 },
+    // keep /callback?code=...&state=... out of invocation logs
+    "redact_query_string": true
+  }
+  // secrets (wrangler secret put):
+  // GITHUB_CLIENT_SECRET, CHIEF_WEBHOOK_URL, CHIEF_WEBHOOK_KEY, BOXMCP_CHIEF_API_KEY, BOXMCP_CHIEF_API_KEY_NEXT
+}

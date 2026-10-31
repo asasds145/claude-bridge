@@ -1,0 +1,7 @@
+# Copy to .dev.vars for `wrangler dev`. Never commit .dev.vars.
+GITHUB_CLIENT_SECRET=<your-github-oauth-client-secret>
+CHIEF_WEBHOOK_URL=https://<your-agent-webhook-host>/<path>
+CHIEF_WEBHOOK_KEY=<random-bearer-token-for-the-webhook>
+BOXMCP_CHIEF_API_KEY=<random-api-key-for-/chief-endpoints>
+# Optional, for zero-downtime key rotation
+BOXMCP_CHIEF_API_KEY_NEXT=

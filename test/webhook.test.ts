@@ -1,0 +1,137 @@
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env } from "cloudflare:workers";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Env } from "../src/env";
+import { queueStub } from "../src/env";
+import { WEBHOOK_DEBOUNCE_MS, WEBHOOK_MIN_GAP_MS, type BoxmcpQueue } from "../src/queue";
+
+const E = env as unknown as Env;
+type Call = { url: string; body: string; auth: string | null };
+
+async function until(pred: () => boolean | Promise<boolean>, ms = 3000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!(await pred())) {
+    if (Date.now() > end) throw new Error("timeout waiting for condition");
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+const meta = (k: string) =>
+  runInDurableObject(queueStub(E), (_i: BoxmcpQueue, state) => {
+    const rows = state.storage.sql.exec<{ v: string }>(`SELECT v FROM meta WHERE k = ?`, k).toArray();
+    return rows.length ? rows[0].v : null;
+  });
+
+let calls: Call[];
+function mockFetch(impl: () => Promise<Response> | Response) {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const req = new Request(input as RequestInfo, init as RequestInit);
+    calls.push({ url: req.url, body: await req.text(), auth: req.headers.get("authorization") });
+    return impl();
+  });
+}
+
+beforeEach(async () => {
+  calls = [];
+  // 테스트 전용 가짜 webhook 설정 (실제 URL/secret 아님) + 깨끗한 webhook 상태
+  await runInDurableObject(queueStub(E), (inst: BoxmcpQueue, state) => {
+    (inst as unknown as { env: Env }).env = { ...E, CHIEF_WEBHOOK_URL: "https://hook.invalid/x", CHIEF_WEBHOOK_KEY: "fake-key" };
+    state.storage.sql.exec(`UPDATE messages SET acked = 1 WHERE direction = 'to_chief'`);
+    state.storage.sql.exec(`DELETE FROM meta WHERE k IN ('wh_due','wh_attempt','wh_sends','wh_chain_wm')`);
+  });
+});
+afterEach(() => vi.restoreAllMocks());
+
+describe("webhook (immediate / spacing / retry / no stranding)", () => {
+  it("has no debounce", () => {
+    expect(WEBHOOK_DEBOUNCE_MS).toBe(0);
+  });
+
+  it("fires immediately after a quiet period, then spaces a rapid second send without stranding it", async () => {
+    mockFetch(() => new Response("ok", { status: 200 }));
+    const stub = queueStub(E);
+    const t0 = Date.now();
+    await stub.sendToChief("one");
+    await until(() => calls.length === 1);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(JSON.parse(calls[0].body)).toEqual({ source: "chief-bridge", pending: 1 });
+    expect(calls[0].auth).toBe("Bearer fake-key");
+    await until(async () => (await stub.status()).webhook_scheduled === false);
+
+    // 직후 두 번째 메시지: MIN_GAP 만큼 뒤로 예약되고, 그 시각에 실제로 발사됨
+    await stub.sendToChief("two");
+    const due = Number(await meta("wh_due"));
+    expect(due).toBeGreaterThan(Date.now() + 500);
+    expect(due).toBeLessThanOrEqual(Date.now() + WEBHOOK_MIN_GAP_MS + 100);
+    expect(calls.length).toBe(1);
+    await until(() => calls.length === 2, WEBHOOK_MIN_GAP_MS + 4000);
+    expect(JSON.parse(calls[1].body).pending).toBe(2);
+    await until(async () => (await stub.status()).webhook_scheduled === false);
+  }, 20_000);
+
+  it("retries after 1 min on failure", async () => {
+    mockFetch(() => new Response("fail", { status: 500 }));
+    const stub = queueStub(E);
+    await stub.sendToChief("r");
+    await until(() => calls.length === 1);
+    await until(async () => (await meta("wh_attempt")) === "1");
+    const due = Number(await meta("wh_due"));
+    expect(due - Date.now()).toBeGreaterThanOrEqual(55_000);
+    expect(due - Date.now()).toBeLessThanOrEqual(61_000);
+    // wh_due만 과거로 당기고, 알람 자체는 미래에 둔 채 runDurableObjectAlarm으로 즉시 실행
+    await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      state.storage.sql.exec(`UPDATE meta SET v = ? WHERE k = 'wh_due'`, String(Date.now() - 1));
+      // 1분이 지난 것처럼 직전 발사 기록도 과거로 (MIN_GAP에 걸리지 않게)
+      state.storage.sql.exec(`UPDATE meta SET v = ? WHERE k = 'wh_sends'`, JSON.stringify([Date.now() - 60_000]));
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(calls.length).toBe(2);
+    const due2 = Number(await meta("wh_due"));
+    expect(due2 - Date.now()).toBeGreaterThanOrEqual(4 * 60_000);
+    expect(await meta("wh_attempt")).toBe("2");
+  });
+
+  it("a message arriving while a webhook is in flight gets a follow-up webhook", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let n = 0;
+    mockFetch(async () => {
+      if (n++ === 0) await gate;
+      return new Response("ok", { status: 200 });
+    });
+    const stub = queueStub(E);
+    await stub.sendToChief("first");
+    await until(() => calls.length === 1);
+    await stub.sendToChief("during"); // wh_due가 아직 설정돼 있어 합쳐짐
+    const tRelease = Date.now();
+    release();
+    // 후속 webhook이 attempt 0으로 MIN_GAP 뒤에 예약됨
+    await until(async () => Number(await meta("wh_due")) > tRelease);
+    expect(await meta("wh_attempt")).toBe("0");
+    expect(calls.length).toBe(1);
+    await until(() => calls.length === 2, WEBHOOK_MIN_GAP_MS + 4000);
+    expect(Date.now() - tRelease).toBeGreaterThanOrEqual(WEBHOOK_MIN_GAP_MS - 500);
+    await until(async () => (await stub.status()).webhook_scheduled === false);
+  }, 20_000);
+
+  it("after retries are exhausted, messages that joined the chain get a fresh chain; otherwise it stops", async () => {
+    mockFetch(() => new Response("fail", { status: 500 }));
+    const stub = queueStub(E);
+    await stub.sendToChief("a");
+    await until(async () => (await meta("wh_attempt")) === "1");
+    await stub.sendToChief("joined"); // 재시도 대기 중 합쳐짐
+    const fire = async () => {
+      await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+        state.storage.sql.exec(`UPDATE meta SET v = ? WHERE k = 'wh_due'`, String(Date.now() - 1));
+        state.storage.sql.exec(`UPDATE meta SET v = '[]' WHERE k = 'wh_sends'`);
+      });
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+    };
+    for (let i = 0; i < 3; i++) await fire(); // 재시도 1..3
+    expect(calls.length).toBe(4);
+    expect(await meta("wh_attempt")).toBe("0"); // 'joined' 때문에 새 체인
+    expect(await meta("wh_due")).not.toBeNull();
+    for (let i = 0; i < 4; i++) await fire(); // 새 체인 0..3, 그 사이 새 메시지 없음
+    expect(calls.length).toBe(8);
+    expect(await meta("wh_due")).toBeNull();
+  });
+});
