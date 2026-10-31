@@ -1,7 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
-import { logLine, stripControl, type StoredMessage } from "./util";
-import { errorSummary } from "./auth-github";
+import { errorClass, logLine, stripControl, type StoredMessage } from "./util";
 
 export const RETENTION_MS = 30 * 24 * 3600 * 1000;
 export const MAX_PER_THREAD = 200;
@@ -15,7 +14,31 @@ export const WEBHOOK_MAX_PER_HOUR = 60;
 export const WEBHOOK_RETRY_MS = [1, 5, 15].map((m) => m * 60 * 1000);
 export const CLEANUP_INTERVAL_MS = 6 * 3600 * 1000;
 export const MAX_WAITERS = 10;
+/** Hard cap so unauthenticated callers cannot grow the in-memory map without bound. */
+export const MAX_RATE_BUCKETS = 1024;
 const HOUR = 3600 * 1000;
+
+export type WebhookBlockReason = "non_https" | "invalid_url" | "missing_key";
+
+/**
+ * Why a webhook must not be sent, or null when it is safe to send.
+ * An unset URL is "not configured" (null), not an error: nothing is woken and nothing is logged.
+ * Non-https is refused so the bearer key is never sent in cleartext. Embedded userinfo is refused
+ * because it is another credential on the request line.
+ */
+export function webhookBlockReason(url: string | undefined, key: string | undefined): WebhookBlockReason | null {
+  if (!url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "invalid_url";
+  }
+  if (parsed.protocol !== "https:") return "non_https";
+  if (parsed.username !== "" || parsed.password !== "" || parsed.hostname === "") return "invalid_url";
+  if (!key?.trim()) return "missing_key";
+  return null;
+}
 
 type Waiter = {
   token?: string;
@@ -83,18 +106,27 @@ export class BoxmcpQueue extends DurableObject<Env> {
   }
 
   // ---------- rate limit (DO 메모리; eviction 시 초기화) ----------
+  // New keys are refused once the map is full (after dropping expired entries). Callers that
+  // have not authenticated must use a fixed key, not one derived from an untrusted header.
   async rateLimit(key: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
     const now = Date.now();
-    let b = this.buckets.get(key);
-    if (!b || b.resetAt <= now) {
-      b = { count: 0, resetAt: now + windowMs };
-      this.buckets.set(key, b);
+    const existing = this.buckets.get(key);
+    if (!existing || existing.resetAt <= now) {
+      const reusesSlot = existing !== undefined && existing.resetAt <= now;
+      if (!reusesSlot && this.buckets.size >= MAX_RATE_BUCKETS) {
+        for (const [k, v] of this.buckets) if (v.resetAt <= now) this.buckets.delete(k);
+      }
+      if (!this.buckets.has(key) && this.buckets.size >= MAX_RATE_BUCKETS) {
+        let soonest = now + windowMs;
+        for (const v of this.buckets.values()) if (v.resetAt < soonest) soonest = v.resetAt;
+        return { ok: false, retryAfter: Math.max(1, Math.ceil((soonest - now) / 1000)) };
+      }
+      const fresh = { count: 1, resetAt: now + windowMs };
+      this.buckets.set(key, fresh);
+      return { ok: true, retryAfter: 0 };
     }
-    if (this.buckets.size > 10000) {
-      for (const [k, v] of this.buckets) if (v.resetAt <= now) this.buckets.delete(k);
-    }
-    if (b.count >= limit) return { ok: false, retryAfter: Math.ceil((b.resetAt - now) / 1000) };
-    b.count++;
+    if (existing.count >= limit) return { ok: false, retryAfter: Math.ceil((existing.resetAt - now) / 1000) };
+    existing.count++;
     return { ok: true, retryAfter: 0 };
   }
 
@@ -278,8 +310,9 @@ export class BoxmcpQueue extends DurableObject<Env> {
       last_to_chief_at: lastC,
       last_to_claude_at: lastR,
       waiters: this.waiters.size,
-      webhook_configured: Boolean(this.env.CHIEF_WEBHOOK_URL),
-      webhook_url_valid: (() => { try { const u = new URL(this.env.CHIEF_WEBHOOK_URL ?? ""); return u.protocol === "https:"; } catch { return false; } })(),
+      webhook_configured: webhookBlockReason(this.env.CHIEF_WEBHOOK_URL, this.env.CHIEF_WEBHOOK_KEY) === null && Boolean(this.env.CHIEF_WEBHOOK_URL),
+      // A placeholder key so "missing key" is not reported as an invalid URL.
+      webhook_url_valid: webhookBlockReason(this.env.CHIEF_WEBHOOK_URL, "set") === null && Boolean(this.env.CHIEF_WEBHOOK_URL),
       webhook_scheduled: this.getMeta("wh_due") !== null,
     };
   }
@@ -301,6 +334,12 @@ export class BoxmcpQueue extends DurableObject<Env> {
   }
 
   private async scheduleWebhook(): Promise<void> {
+    const blocked = webhookBlockReason(this.env.CHIEF_WEBHOOK_URL, this.env.CHIEF_WEBHOOK_KEY);
+    if (blocked) {
+      // Reason code only. The URL and key are operator secrets and must not be logged.
+      logLine("webhook_skipped", { reason: blocked });
+      return;
+    }
     if (!this.env.CHIEF_WEBHOOK_URL) return;
     if (this.getMeta("wh_due") !== null) {
       // 이미 예약됨(또는 발사 중) → 합침. 발사 중에 도착한 메시지는 runWebhook이 id watermark로 감지해 후속 예약.
@@ -327,6 +366,12 @@ export class BoxmcpQueue extends DurableObject<Env> {
   }
 
   private async runWebhook(now: number): Promise<void> {
+    const blocked = webhookBlockReason(this.env.CHIEF_WEBHOOK_URL, this.env.CHIEF_WEBHOOK_KEY);
+    if (blocked) {
+      logLine("webhook_skipped", { reason: blocked });
+      this.clearWebhook();
+      return;
+    }
     const url = this.env.CHIEF_WEBHOOK_URL;
     const pending = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM messages WHERE direction='to_chief' AND acked=0`).one().n;
     if (!url || pending === 0) {
@@ -349,11 +394,12 @@ export class BoxmcpQueue extends DurableObject<Env> {
     let ok = false;
     try {
       const headers = new Headers({ "content-type": "application/json" });
-      if (this.env.CHIEF_WEBHOOK_KEY) {
-        const name = this.env.CHIEF_WEBHOOK_AUTH_HEADER || "Authorization";
-        const scheme = this.env.CHIEF_WEBHOOK_AUTH_SCHEME;
-        headers.set(name, scheme ? `${scheme} ${this.env.CHIEF_WEBHOOK_KEY}` : this.env.CHIEF_WEBHOOK_KEY);
-      }
+      // webhookBlockReason already required a non-empty key. Unset scheme defaults to Bearer;
+      // an explicit empty scheme sends the raw key (wrangler.jsonc sets Bearer).
+      const key = this.env.CHIEF_WEBHOOK_KEY as string;
+      const name = this.env.CHIEF_WEBHOOK_AUTH_HEADER || "Authorization";
+      const scheme = this.env.CHIEF_WEBHOOK_AUTH_SCHEME ?? "Bearer";
+      headers.set(name, scheme ? `${scheme} ${key}` : key);
       const res = await fetch(url, {
         method: "POST",
         headers,
@@ -365,8 +411,8 @@ export class BoxmcpQueue extends DurableObject<Env> {
       await res.body?.cancel();
       logLine("webhook", { status: res.status });
     } catch (e) {
-      const { err_name, err_message } = errorSummary(e);
-      logLine("webhook", { status: "error", err_name, err_message: err_message.replace(/https?:\/\/\S+/gi, "[url]") });
+      // Fetch errors often embed the destination URL in the message. Log the class only.
+      logLine("webhook", { status: "error", err_name: errorClass(e) });
     }
 
     if (ok) {

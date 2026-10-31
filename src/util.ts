@@ -56,23 +56,33 @@ export class HttpError extends Error {
   }
 }
 
-/** 64KB 상한으로 body를 읽어 JSON 파싱 */
-export async function readJsonLimited(req: Request, max = MAX_BODY_BYTES): Promise<unknown> {
+/**
+ * Read the body up to `max` bytes.
+ * Content-Length is only an early reject: a missing or understated length still stops at `max`.
+ * Stream errors become a generic 400 so the original message (which may quote user input) is not surfaced.
+ */
+export async function readBodyLimited(req: Request, max: number): Promise<Uint8Array> {
   const cl = req.headers.get("content-length");
-  if (cl !== null && Number(cl) > max) throw new HttpError(413, "body too large");
-  if (!req.body) throw new HttpError(400, "missing body");
+  if (cl !== null && /^\d+$/.test(cl) && Number(cl) > max) throw new HttpError(413, "body too large");
+  if (!req.body) return new Uint8Array(0);
   const reader = req.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > max) {
-      await reader.cancel();
-      throw new HttpError(413, "body too large");
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > max) {
+        await reader.cancel().catch(() => {});
+        throw new HttpError(413, "body too large");
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
+    throw new HttpError(400, "bad body");
   }
   const buf = new Uint8Array(total);
   let off = 0;
@@ -80,9 +90,17 @@ export async function readJsonLimited(req: Request, max = MAX_BODY_BYTES): Promi
     buf.set(c, off);
     off += c.byteLength;
   }
+  return buf;
+}
+
+/** 64KB 상한으로 body를 읽어 JSON 파싱 */
+export async function readJsonLimited(req: Request, max = MAX_BODY_BYTES): Promise<unknown> {
+  if (!req.body) throw new HttpError(400, "missing body");
+  const buf = await readBodyLimited(req, max);
   try {
     return JSON.parse(new TextDecoder().decode(buf));
-  } catch {
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
     throw new HttpError(400, "invalid json");
   }
 }
@@ -98,7 +116,27 @@ export function clientIp(req: Request): string {
   return req.headers.get("cf-connecting-ip") ?? "unknown";
 }
 
-/** 로그: 경로/상태만. body·헤더·토큰·URL query 미포함 */
+/** Names we are willing to log. Anything else collapses to "Error" so a custom name cannot carry message text. */
+const LOG_ERROR_NAMES = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "SyntaxError",
+  "ReferenceError",
+  "URIError",
+  "EvalError",
+  "AbortError",
+  "TimeoutError",
+  "DOMException",
+]);
+
+/** Error class only. Message and stack are omitted: they can contain relayed message text or a URL. */
+export function errorClass(e: unknown): string {
+  if (e instanceof Error) return LOG_ERROR_NAMES.has(e.name) ? e.name : "Error";
+  return typeof e;
+}
+
+/** Logs: event, path, status, counts, error class/code. No message body, stack, header, token, URL, or query. */
 export function logLine(event: string, fields: Record<string, string | number | boolean> = {}): void {
   console.log(JSON.stringify({ event, ...fields }));
 }

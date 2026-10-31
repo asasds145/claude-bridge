@@ -67,6 +67,7 @@ describe("MCP tools", () => {
   });
   it("initialize returns loop instructions; send_to_chief result tells Claude to keep waiting", async () => {
     const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } });
+    expect(init.json.result.serverInfo.version).toBe("1.0.0");
     const ins = init.json.result.instructions as string;
     expect(ins).toContain("wait_for_reply");
     expect(ins).toContain("read_chief_replies");

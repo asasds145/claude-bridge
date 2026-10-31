@@ -35,18 +35,33 @@ async function call(req: Request) {
   return res;
 }
 
+let lastTokenBody = "";
+
 function mockUpstream(githubId: number) {
+  lastTokenBody = "";
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-    const url = new Request(input as RequestInfo, init as RequestInit).url;
+    const req = new Request(input as RequestInfo, init as RequestInit);
+    const url = req.url;
     if (url === CIMD_ID)
       return Response.json({
         client_id: CIMD_ID, client_name: "Claude (claude.ai)", redirect_uris: [CLAUDE_REDIRECT_URI],
         grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "none",
       }, { headers: { "cache-control": "max-age=300" } });
-    if (url === "https://github.com/login/oauth/access_token") return Response.json({ access_token: "gho_fake_test_token" });
+    if (url === "https://github.com/login/oauth/access_token") {
+      // .text() warns and may mis-decode this form body. Read the bytes instead.
+      lastTokenBody = new TextDecoder().decode(await req.arrayBuffer());
+      return Response.json({ access_token: "gho_fake_test_token" });
+    }
     if (url === "https://api.github.com/user") return Response.json({ id: githubId, login: "x" });
     return new Response("unexpected " + url, { status: 599 });
   });
+}
+
+async function s256(verifier: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+  let s = "";
+  for (const b of digest) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 async function flow(githubId: number) {
@@ -73,10 +88,19 @@ async function flow(githubId: number) {
   const gh = new URL(p.headers.get("location")!);
   expect(gh.origin + gh.pathname).toBe("https://github.com/login/oauth/authorize");
   expect(gh.searchParams.get("redirect_uri")).toBe(`${BASE}/callback`);
+  expect(gh.searchParams.get("code_verifier")).toBeNull();
+  expect(gh.searchParams.get("code_challenge_method")).toBe("S256");
+  const challenge = gh.searchParams.get("code_challenge");
+  expect(challenge).toMatch(/^[A-Za-z0-9_-]{43}$/);
   jar.take(p);
-  return call(new Request(`${BASE}/callback?code=fake-gh-code&state=${encodeURIComponent(gh.searchParams.get("state")!)}`, {
+  const done = await call(new Request(`${BASE}/callback?code=fake-gh-code&state=${encodeURIComponent(gh.searchParams.get("state")!)}`, {
     redirect: "manual", headers: { cookie: jar.header() },
   }));
+  const sent = new URLSearchParams(lastTokenBody);
+  const verifier = sent.get("code_verifier") ?? "";
+  expect(verifier).not.toBe("");
+  expect(await s256(verifier)).toBe(challenge);
+  return done;
 }
 
 describe("OAuth full flow (CIMD Claude client, scope mcp offline_access)", () => {
@@ -101,16 +125,25 @@ describe("auth helpers", () => {
     expect(ownerUserId(12345678)).toBe("github-12345678");
     expect(ownerUserId(12345678).includes(":")).toBe(false);
   });
-  it("errorSummary: name + truncated message/stack, secrets redacted", async () => {
-    const { errorSummary } = await import("../src/auth-github");
-    const e = new TypeError("boom Bearer abc.def code=xyz123&x=1 " + "A".repeat(40) + " " + "m".repeat(500));
-    const s = errorSummary(e);
-    expect(s.err_name).toBe("TypeError");
-    expect(s.err_message.length).toBeLessThanOrEqual(200);
-    expect(s.err_message).not.toContain("abc.def");
-    expect(s.err_message).not.toContain("xyz123");
-    expect(s.err_message).not.toContain("A".repeat(40));
-    expect(s.err_stack.length).toBeLessThanOrEqual(800);
+  it("mcp user id must match the current owner", async () => {
+    const { mcpUserMatchesOwner } = await import("../src/auth-github");
+    expect(mcpUserMatchesOwner("github-12345678", "12345678")).toBe(true);
+    expect(mcpUserMatchesOwner("github-12345678", " 12345678 ")).toBe(true);
+    expect(mcpUserMatchesOwner("github-1", "12345678")).toBe(false);
+    expect(mcpUserMatchesOwner("github-12345678", "0")).toBe(false);
+    expect(mcpUserMatchesOwner(undefined, "12345678")).toBe(false);
+    expect(mcpUserMatchesOwner("github-12345678", undefined)).toBe(false);
+  });
+  it("errorClass logs the class only, never the message", async () => {
+    const { errorClass } = await import("../src/util");
+    const e = new TypeError("boom Bearer abc.def relayed message text " + "m".repeat(500));
+    expect(errorClass(e)).toBe("TypeError");
+    expect(errorClass(e)).not.toContain("abc.def");
+    expect(errorClass(e)).not.toContain("relayed");
+    const named = new Error("secret message body");
+    named.name = "secret message body";
+    expect(errorClass(named)).toBe("Error");
+    expect(errorClass("plain secret")).toBe("string");
   });
 });
 
@@ -132,13 +165,60 @@ describe("strings that deploy/verify-chief-bridge.sh greps for", () => {
   });
 });
 
-describe("errorSummary extra redaction forms", () => {
-  it("JSON, url-encoded, __Host- cookie, stack path", async () => {
-    const { errorSummary } = await import("../src/auth-github");
-    const e = new Error('x {"code":"abc123","access_token":"tok1"} y code%3Dsecret9 z __Host-oauth-c=short.v+1/2');
-    e.stack = "Error: refresh_token=rt1 at f (__Host-x=yy)\n at g";
-    const s = errorSummary(e);
-    const all = s.err_message + s.err_stack;
-    for (const leak of ["abc123", "tok1", "secret9", "short.v", "rt1", "yy"]) expect(all).not.toContain(leak);
+describe("consent POST body limit", () => {
+  it("oversized body without a trustworthy Content-Length is 413, not parsed", async () => {
+    const { CONSENT_MAX_BODY } = await import("../src/auth-github");
+    const payload = "x".repeat(CONSENT_MAX_BODY + 64);
+    let sent = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent) {
+          controller.close();
+          return;
+        }
+        sent = true;
+        controller.enqueue(new TextEncoder().encode(payload));
+      },
+    });
+    const req = new Request(`${BASE}/authorize`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    // The bug was trusting a missing or small Content-Length and then calling formData() unbounded.
+    expect(Number(req.headers.get("content-length") ?? "0")).toBeLessThanOrEqual(CONSENT_MAX_BODY);
+    const res = await call(req);
+    expect(res.status).toBe(413);
+    expect(await res.text()).toContain("too large");
+  });
+
+  it("Content-Length under the cap does not allow a larger body", async () => {
+    const { CONSENT_MAX_BODY } = await import("../src/auth-github");
+    const payload = "y".repeat(CONSENT_MAX_BODY + 32);
+    const req = new Request(`${BASE}/authorize`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded", "content-length": "16" },
+      body: payload,
+    });
+    const res = await call(req);
+    expect(res.status).toBe(413);
+  });
+
+  it("a body stream error is 400 and the error text is not returned", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(new Error("secret relayed message must not leak"));
+      },
+    });
+    const res = await call(new Request(`${BASE}/authorize`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+    }));
+    expect(res.status).toBe(400);
+    const text = await res.text();
+    expect(text).not.toContain("secret");
+    expect(text).not.toContain("relayed");
+    expect(text).not.toContain("must not leak");
   });
 });

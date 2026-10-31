@@ -1,6 +1,6 @@
 import { AuthorizationError, type AuthRequest } from "@cloudflare/workers-oauth-provider";
 import type { Env } from "./env";
-import { escapeAttr, logLine } from "./util";
+import { errorClass, escapeAttr, HttpError, logLine, readBodyLimited } from "./util";
 
 export const CLAUDE_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback";
 const GITHUB_AUTHORIZE = "https://github.com/login/oauth/authorize";
@@ -34,9 +34,26 @@ function configured(env: Env): boolean {
   return Boolean(env.GITHUB_CLIENT_SECRET && env.GITHUB_CLIENT_ID && env.BOXMCP_OWNER_GITHUB_ID && env.BOXMCP_OWNER_GITHUB_ID !== "0");
 }
 
-/** 오류 리다이렉트는 고정된 Claude callback으로만 (DCR/CIMD로 등록된 임의 URI로의 오류 리다이렉트 차단) */
+/**
+ * Error redirects may only go to the fixed Claude callback.
+ * Check the actual destination (origin + path), not only the associated redirectUri:
+ * a truthy redirectTo paired with the right redirectUri would otherwise be trusted blindly.
+ */
 export function allowedErrorRedirect(redirectUri: string | undefined, redirectTo: string | undefined): boolean {
-  return Boolean(redirectTo) && redirectUri === CLAUDE_REDIRECT_URI;
+  if (redirectUri !== CLAUDE_REDIRECT_URI || !redirectTo) return false;
+  try {
+    const dest = new URL(redirectTo);
+    const allowed = new URL(CLAUDE_REDIRECT_URI);
+    return (
+      dest.protocol === "https:" &&
+      dest.origin === allowed.origin &&
+      dest.pathname === allowed.pathname &&
+      dest.username === "" &&
+      dest.password === ""
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** PKCE S256 필수 (기밀 클라이언트 포함) */
@@ -49,24 +66,14 @@ export function ownerUserId(githubId: number): string {
   return `github-${githubId}`;
 }
 
-/** 디버깅용 오류 요약: name, 잘린 message/stack만. 토큰·코드·쿠키·Bearer 값처럼 보이는 부분은 가림 */
-export function errorSummary(e: unknown): Record<string, string> {
-  const scrub = (t: string) =>
-    t
-      .replace(/(bearer|basic)\s+[^\s"']+/gi, "$1 [redacted]")
-      .replace(/%3D/gi, "=")
-      .replace(/\b(code|state|token|access_token|refresh_token|client_secret|handle|cookie)=([^&\s"']+)/gi, "$1=[redacted]")
-      .replace(/"(code|state|token|access_token|refresh_token|client_secret|handle)"\s*:\s*"[^"]*"/gi, '"$1":"[redacted]"')
-      .replace(/__Host-[^=;\s]+=[^;\s]+/g, "__Host-[redacted]")
-      .replace(/[A-Za-z0-9_\-]{32,}/g, "[redacted]");
-  if (e instanceof Error) {
-    return {
-      err_name: e.name.slice(0, 64),
-      err_message: scrub(String(e.message)).slice(0, 200),
-      err_stack: scrub(String(e.stack ?? "")).split("\n").slice(0, 6).join(" | ").slice(0, 800),
-    };
-  }
-  return { err_name: typeof e, err_message: "" };
+/**
+ * True when the validated token subject is the GitHub user currently configured as owner.
+ * Checked on each MCP call so a previous owner's access token stops working after the id changes.
+ */
+export function mcpUserMatchesOwner(userId: string | undefined, ownerGithubId: string | undefined): userId is string {
+  const owner = ownerGithubId?.trim() ?? "";
+  if (!/^\d+$/.test(owner) || owner === "0") return false;
+  return userId === `github-${owner}`;
 }
 
 function handleAuthError(e: unknown, where: string): Response {
@@ -75,7 +82,7 @@ function handleAuthError(e: unknown, where: string): Response {
     if (e.redirectTo && allowedErrorRedirect(e.redirectUri, e.redirectTo)) return Response.redirect(e.redirectTo, 302);
     return errorPage(400, `요청 오류: ${e.code}`);
   }
-  logLine("oauth_error", { where, code: "internal", ...errorSummary(e) });
+  logLine("oauth_error", { where, code: "internal", err_name: errorClass(e) });
   return errorPage(500, "내부 오류");
 }
 
@@ -117,15 +124,39 @@ async function authorizeGet(req: Request, env: Env): Promise<Response> {
   return page("chief-bridge 연결 승인", body, 200, headers);
 }
 
+/** POST /authorize body cap. Enforced by reading the stream, not by trusting Content-Length. */
+export const CONSENT_MAX_BODY = 8192;
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** GitHub login leg PKCE. The verifier stays in the upstream transaction, not on the redirect URL. */
+async function githubPkce(): Promise<{ verifier: string; challenge: string }> {
+  const verifier = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
+  return { verifier, challenge: bytesToBase64Url(digest) };
+}
+
 /** POST /authorize: 동의 처리 → GitHub로 */
 async function authorizePost(req: Request, env: Env): Promise<Response> {
   const ct = req.headers.get("content-type") ?? "";
   if (!ct.startsWith("application/x-www-form-urlencoded")) return errorPage(415, "unsupported content-type");
-  const cl = Number(req.headers.get("content-length") ?? "0");
-  if (cl > 8192) return errorPage(413, "too large");
-  const form = await req.formData();
-  const handle = String(form.get("handle") ?? "");
-  const action = String(form.get("action") ?? "");
+  let handle: string;
+  let action: string;
+  try {
+    // Cap the bytes actually read. A missing or small Content-Length must not unlock a larger body.
+    const bytes = await readBodyLimited(req, CONSENT_MAX_BODY);
+    const form = new URLSearchParams(new TextDecoder().decode(bytes));
+    handle = form.get("handle") ?? "";
+    action = form.get("action") ?? "";
+  } catch (e) {
+    const status = e instanceof HttpError && (e.status === 400 || e.status === 413) ? e.status : 400;
+    if (!(e instanceof HttpError)) logLine("oauth_error", { where: "consent_body", code: "bad_body", err_name: errorClass(e) });
+    return errorPage(status, status === 413 ? "too large" : "bad request");
+  }
   try {
     if (action !== "approve") {
       const denied = await env.OAUTH_PROVIDER.denyConsent(req, handle);
@@ -133,12 +164,18 @@ async function authorizePost(req: Request, env: Env): Promise<Response> {
     }
     // scope 미지정 = 클라이언트가 요청한 scope (scopesSupported 안에서 라이브러리가 검증)
     const approved = await env.OAUTH_PROVIDER.approveConsent(req, handle);
-    const { state, headers } = await env.OAUTH_PROVIDER.beginUpstream(approved.request, { headers: approved.headers });
+    const pkce = await githubPkce();
+    const { state, headers } = await env.OAUTH_PROVIDER.beginUpstream(approved.request, {
+      headers: approved.headers,
+      data: { codeVerifier: pkce.verifier },
+    });
     const origin = new URL(req.url).origin;
     const gh = new URL(GITHUB_AUTHORIZE);
     gh.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
     gh.searchParams.set("redirect_uri", `${origin}/callback`);
     gh.searchParams.set("state", state);
+    gh.searchParams.set("code_challenge", pkce.challenge);
+    gh.searchParams.set("code_challenge_method", "S256");
     gh.searchParams.set("allow_signup", "false");
     // scope 파라미터 없음: 공개 프로필(id)만 필요
     headers.set("location", gh.toString());
@@ -152,7 +189,7 @@ async function authorizePost(req: Request, env: Env): Promise<Response> {
 async function callback(req: Request, env: Env): Promise<Response> {
   let resumed;
   try {
-    resumed = await env.OAUTH_PROVIDER.finishUpstream(req);
+    resumed = await env.OAUTH_PROVIDER.finishUpstream<{ codeVerifier?: string }>(req);
   } catch (e) {
     return handleAuthError(e, "callback_state");
   }
@@ -167,15 +204,18 @@ async function callback(req: Request, env: Env): Promise<Response> {
 
   let githubId: number;
   try {
+    const tokenBody = new URLSearchParams({
+      client_id: env.GITHUB_CLIENT_ID,
+      client_secret: env.GITHUB_CLIENT_SECRET ?? "",
+      code,
+      redirect_uri: `${url.origin}/callback`,
+    });
+    // Present only when this login started with a challenge. In-flight logins from before that have neither.
+    if (resumed.data?.codeVerifier) tokenBody.set("code_verifier", resumed.data.codeVerifier);
     const tokRes = await fetch(GITHUB_TOKEN, {
       method: "POST",
       headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: env.GITHUB_CLIENT_ID,
-        client_secret: env.GITHUB_CLIENT_SECRET ?? "",
-        code,
-        redirect_uri: `${url.origin}/callback`,
-      }),
+      body: tokenBody,
     });
     const tok = (await tokRes.json()) as { access_token?: string; error?: unknown };
     if (!tokRes.ok || !tok.access_token) {
@@ -194,7 +234,7 @@ async function callback(req: Request, env: Env): Promise<Response> {
     if (typeof user.id !== "number") return fail("user_shape");
     githubId = user.id;
   } catch (e) {
-    logLine("oauth_error", { where: "callback", code: "upstream_error", ...errorSummary(e) });
+    logLine("oauth_error", { where: "callback", code: "upstream_error", err_name: errorClass(e) });
     return fail("upstream_error");
   }
 

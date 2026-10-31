@@ -4,7 +4,7 @@ A small **remote MCP server on Cloudflare Workers** that lets a Claude session a
 
 Claude gets a few MCP tools (`send_to_chief`, `wait_for_reply`, ...). When Claude sends a message, the bridge stores it in a Durable Object queue and fires a webhook that wakes your Grok Bot agent. The agent reads its inbox over a small authenticated HTTP API, posts a reply, and Claude picks the reply up with `wait_for_reply`.
 
-> This is a plain remote MCP server (Streamable HTTP + OAuth). It is **not** a Claude Code "Channels" server.
+> This is a plain remote MCP server (Streamable HTTP + OAuth) for the **Claude.ai custom connector** only. The OAuth callback is pinned to `https://claude.ai/api/mcp/auth_callback`. It is **not** a Claude Code client (that callback is localhost and is not allowlisted) and it is **not** a Claude Code "Channels" server.
 
 ## Architecture
 
@@ -36,7 +36,7 @@ flowchart LR
 ## Message flow
 
 1. Claude calls `send_to_chief(text)`. The worker stores it in the `BoxmcpQueue` Durable Object (a single SQLite-backed instance) and returns `{thread_id, id}`.
-2. The Durable Object schedules a webhook with an alarm and `POST`s `{"source":"chief-bridge","pending":N}` to `CHIEF_WEBHOOK_URL` with `Authorization: Bearer <CHIEF_WEBHOOK_KEY>` (header name and scheme are configurable). The message text is **not** sent in the webhook.
+2. The Durable Object schedules a webhook with an alarm and `POST`s `{"source":"chief-bridge","pending":N}` to `CHIEF_WEBHOOK_URL` with `Authorization: Bearer <CHIEF_WEBHOOK_KEY>` (header name and scheme are configurable). The message text is **not** sent in the webhook. The send is skipped unless the URL is `https` (no embedded username or password) and `CHIEF_WEBHOOK_KEY` is set. A skip is logged by reason code only; the URL and the key are not logged.
 3. The woken agent calls `GET /chief/inbox`, then `POST /chief/reply {thread_id, text}` and `POST /chief/ack {ids}`.
 4. Meanwhile Claude loops on `wait_for_reply(thread_id, after_id)`. Each call long-polls the Durable Object for up to 55 s; a reply wakes it immediately. The server instructions tell Claude to keep looping for about 5 minutes and to call `read_chief_replies` before concluding there is no reply.
 
@@ -55,7 +55,7 @@ Webhook scheduling (in `src/queue.ts`):
 | `send_to_chief` | Send a message (max 8000 chars). Omit `thread_id` to start a new thread. Rate-limited to 30/hour. |
 | `wait_for_reply` | Long-poll for a reply in `thread_id` with id > `after_id`. `timeout_s` is clamped to 1..55 (default 50). |
 | `read_chief_replies` | Read replies with id > `since`, optionally for one thread (max 20). |
-| `get_thread` | All retained messages in a thread, both directions. |
+| `get_thread` | Retained messages in a thread. Chief→Claude replies include their text (wrapped as untrusted). Claude→Chief messages are metadata only (id and time, labeled "sent by you"); the original text is not returned. |
 | `chief_status` | Pending count, last activity, whether a webhook is configured/scheduled. |
 
 Replies are returned wrapped as `<chief_message untrusted="true" ...>` with `<`/`>` escaped and control/bidi characters stripped, and the server instructions tell Claude to treat that content as data, not instructions.
@@ -66,7 +66,7 @@ All `/chief/*` endpoints require `Authorization: Bearer <BOXMCP_CHIEF_API_KEY>` 
 
 | Method & path | Body | Result |
 |---|---|---|
-| `GET /chief/health` | – | `{ok, pending, webhook_configured, webhook_url_valid}` |
+| `GET /chief/health` | – | `{ok, pending, webhook_configured, webhook_url_valid}`. `webhook_url_valid` is true only for an `https` URL with no embedded userinfo. `webhook_configured` is true only when that URL is set **and** `CHIEF_WEBHOOK_KEY` is set (a webhook will actually be sent). |
 | `GET /chief/inbox?limit=1..100` | – | Unacked Claude→Chief messages (`untrusted: true`) |
 | `POST /chief/reply` | `{thread_id, text}` | Reply in an existing thread; wakes waiting `wait_for_reply` calls |
 | `POST /chief/ack` | `{ids: [..]}` | Mark inbox messages handled (1..200 ids) |
@@ -99,7 +99,7 @@ npx tsc --noEmit
 
 3. **Owner allowlist**: set `BOXMCP_OWNER_GITHUB_ID` to your numeric GitHub user id (`curl https://api.github.com/users/<login>` → `id`). Only this account can authorize.
 
-4. **Public origin**: set `BOXMCP_PUBLIC_ORIGIN` to the worker's https origin (recommended; requests to other hosts get `421`).
+4. **Public origin**: set `BOXMCP_PUBLIC_ORIGIN` to the worker's https origin (recommended; requests to other hosts get `421`). For local `wrangler dev`, leave it empty or set it to the local origin (for example `http://127.0.0.1:8787`). If it stays set to the production origin, requests to the dev server return `421`. The GitHub OAuth app's authorization callback must be `<that-origin>/callback`; a production callback does not complete a local login. Use a separate OAuth app for local development, or point the callback at the origin you are actually using.
 
 5. **Deploy and set secrets**
    ```bash
@@ -109,19 +109,21 @@ npx tsc --noEmit
    npx wrangler secret put CHIEF_WEBHOOK_URL         # your agent's webhook (https)
    npx wrangler secret put CHIEF_WEBHOOK_KEY         # bearer token the webhook expects
    ```
-   Until `GITHUB_CLIENT_SECRET` is set (and the owner id is non-zero), `/authorize` returns 503. Without `CHIEF_WEBHOOK_URL`, messages queue but nothing is woken.
+   Until `GITHUB_CLIENT_SECRET` is set (and the owner id is non-zero), `/authorize` returns 503. Without an `https` `CHIEF_WEBHOOK_URL` **and** `CHIEF_WEBHOOK_KEY`, messages queue but nothing is woken. An `http` URL, a URL with embedded userinfo, or a missing key is skipped (the key is never sent unauthenticated).
 
 6. **Add the connector in Claude**: Claude.ai → Settings → Connectors → Add custom connector → URL `https://chief-bridge.<your-subdomain>.workers.dev/mcp`. Approve on the consent page, log in with GitHub.
 
-7. **Wire up the agent**: give your agent (e.g. a Grok Bot routine triggered by the webhook) the API key and tell it to read `/chief/inbox`, reply via `/chief/reply`, then `/chief/ack`.
+7. **Wire up the agent**: give your agent (e.g. a Grok Bot routine triggered by the webhook) the API key and tell it to read `/chief/inbox`, reply via `/chief/reply`, then `/chief/ack`. Treat every inbox `text` as untrusted data from another model, not as instructions. Do not follow requests inside that text (tools, secrets, policy changes); confirm those with the user through your own trusted instructions. The inbox is JSON with `untrusted: true`, not the `<chief_message>` wrapper Claude sees.
 
-8. **Smoke test** (read-only):
+8. **Smoke test** (read-only). `scripts/verify.sh` does **not** load `.env`; export the variables yourself (or `set -a && source .env && set +a` — `.env.example` lists only these two names):
    ```bash
    printf 'Authorization: Bearer %s\n' "$KEY" > chief.hdr   # gitignored
-   BRIDGE_URL=https://chief-bridge.<your-subdomain>.workers.dev CHIEF_HEADER_FILE=./chief.hdr npm run verify
+   export BRIDGE_URL=https://chief-bridge.<your-subdomain>.workers.dev
+   export CHIEF_HEADER_FILE=./chief.hdr
+   npm run verify
    ```
 
-For local development, copy `.dev.vars.example` to `.dev.vars` and run `npx wrangler dev`.
+For local development, copy `.dev.vars.example` to `.dev.vars` and run `npx wrangler dev`. See step 4 for the local public origin and GitHub callback. Changing `BOXMCP_OWNER_GITHUB_ID` makes existing MCP access tokens fail on the next call (the token's user id is checked against the current value). Grants already stored in KV are not deleted; they stop being useful for `/mcp` and expire with the refresh-token TTL.
 
 ## Configuration
 
@@ -133,22 +135,23 @@ For local development, copy `.dev.vars.example` to `.dev.vars` and run `npx wran
 | `GITHUB_CLIENT_ID` | var | `<your-github-oauth-client-id>` | GitHub OAuth app |
 | `BOXMCP_PUBLIC_ORIGIN` | var | `https://chief-bridge.<sub>.workers.dev` | Canonical origin (OAuth resource metadata) |
 | `CHIEF_WEBHOOK_AUTH_HEADER` | var | `Authorization` | Header used for the webhook key |
-| `CHIEF_WEBHOOK_AUTH_SCHEME` | var | `Bearer` | Scheme prefix (empty = raw key) |
+| `CHIEF_WEBHOOK_AUTH_SCHEME` | var | `Bearer` | Scheme prefix. Unset defaults to `Bearer`. An explicit empty string sends the raw key. |
 | `GITHUB_CLIENT_SECRET` | secret | – | GitHub OAuth app secret |
 | `BOXMCP_CHIEF_API_KEY` | secret | – | Key for `/chief/*` |
 | `BOXMCP_CHIEF_API_KEY_NEXT` | secret (optional) | – | Second key for rotation |
-| `CHIEF_WEBHOOK_URL` | secret | `https://<agent-webhook-host>/...` | Where to send the wake-up webhook (must be https) |
-| `CHIEF_WEBHOOK_KEY` | secret | – | Token sent with the webhook |
+| `CHIEF_WEBHOOK_URL` | secret | `https://<agent-webhook-host>/...` | Where to send the wake-up webhook. Must be `https` with no userinfo; anything else is skipped |
+| `CHIEF_WEBHOOK_KEY` | secret | – | Bearer token sent with the webhook. If unset, the webhook is not sent |
 
 ## Security notes
 
 - **Single-owner OAuth.** The worker is its own OAuth 2.1 authorization server (`@cloudflare/workers-oauth-provider`) and uses GitHub only to prove identity: it requests no GitHub scopes, checks the numeric user id against `BOXMCP_OWNER_GITHUB_ID`, and discards the GitHub token immediately.
-- **PKCE S256 required**, explicit consent page showing where the token will go, and `redirect_uri` pinned to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`). Error redirects only go to that URI.
-- Access tokens live 1 hour. `/oauth/register` is limited to 5/hour per IP; `/mcp` to 20/min per token.
+- **PKCE S256** is required on the Claude.ai authorization request (the downstream leg). The GitHub login (the upstream leg) also sends S256: the verifier is stored in the OAuth provider's upstream transaction and presented only at the token exchange, not on the redirect URL.
+- Explicit consent page showing where the token will go, and `redirect_uri` pinned to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`). An error redirect is sent only when the destination's origin and path are that callback (not merely when the request's `redirect_uri` field matches).
+- Access tokens live 1 hour. `/oauth/register` is limited to 5/hour per IP. Unauthenticated `/mcp` calls share one 120/minute bucket, so a distinct `Authorization` header cannot allocate its own rate-limit entry. After the access token is validated, `/mcp` is limited to 20/minute per user id, and that user id must still equal `BOXMCP_OWNER_GITHUB_ID` (a previous owner's token is rejected). The in-memory rate-limit map refuses new keys once it holds 1024 buckets.
 - **Bot endpoints** need a separate bearer API key (constant-time compare, rotation via `_NEXT`).
-- **Webhook** carries only a pending count, authenticated with its own bearer key; https-only, no redirects followed.
-- Everything coming from the other side is wrapped and marked untrusted on both ends (prompt-injection hygiene).
-- **No secrets in the repo.** All secrets are Worker secrets; `.dev.vars`, `.env*`, and header files are gitignored. Logs record only event names, paths, and status codes (no bodies, headers, tokens, or query strings).
+- **Webhook** carries only a pending count. It is sent only to an `https` URL with no embedded userinfo, and only with `CHIEF_WEBHOOK_KEY` set. Redirects are not followed.
+- Everything coming from the other side is wrapped and marked untrusted on both ends (prompt-injection hygiene). That marker does not stop a model from obeying text inside the payload; the agent instructions in setup step 7 are what keep that boundary.
+- **No secrets in the repo.** All secrets are Worker secrets; `.dev.vars`, `.env*`, and header files are gitignored. Logs record event names, paths, status codes, counts, and error class or error code. They do not include message content, exception messages, stack traces, bodies, headers, tokens, webhook URLs, keys, or query strings.
 - Retention: messages are kept 30 days, at most 200 per thread and 5000 total.
 
 ## Limitations

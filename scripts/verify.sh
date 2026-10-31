@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Read-only HTTP smoke checks against a deployed bridge. Never prints the Chief key.
+# Does not load .env. Export BRIDGE_URL and CHIEF_HEADER_FILE yourself.
 # Usage: BRIDGE_URL=https://... CHIEF_HEADER_FILE=./chief.hdr bash scripts/verify.sh
 set -u
 H=${BRIDGE_URL:?set BRIDGE_URL, e.g. https://chief-bridge.<sub>.workers.dev}; H=${H%/}

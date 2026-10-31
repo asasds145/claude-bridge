@@ -3,7 +3,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { queueStub } from "../src/env";
-import { WEBHOOK_DEBOUNCE_MS, WEBHOOK_MIN_GAP_MS, type BoxmcpQueue } from "../src/queue";
+import { WEBHOOK_DEBOUNCE_MS, WEBHOOK_MIN_GAP_MS, webhookBlockReason, type BoxmcpQueue } from "../src/queue";
 
 const E = env as unknown as Env;
 type Call = { url: string; body: string; auth: string | null };
@@ -40,6 +40,89 @@ beforeEach(async () => {
   });
 });
 afterEach(() => vi.restoreAllMocks());
+
+function setWebhookEnv(url: string | undefined, key: string | undefined, scheme?: string) {
+  return runInDurableObject(queueStub(E), (inst: BoxmcpQueue) => {
+    const next: Env = { ...E, CHIEF_WEBHOOK_URL: url, CHIEF_WEBHOOK_KEY: key };
+    if (scheme !== undefined) next.CHIEF_WEBHOOK_AUTH_SCHEME = scheme;
+    (inst as unknown as { env: Env }).env = next;
+  });
+}
+
+describe("webhook destination guards", () => {
+  it("classifies https, non-https, userinfo, and a missing key without echoing them", () => {
+    expect(webhookBlockReason(undefined, undefined)).toBeNull();
+    expect(webhookBlockReason("https://hook.invalid/x", "fake-key")).toBeNull();
+    expect(webhookBlockReason("http://hook.invalid/x", "fake-key")).toBe("non_https");
+    expect(webhookBlockReason("https://user:pass@hook.invalid/x", "fake-key")).toBe("invalid_url");
+    expect(webhookBlockReason("not a url", "fake-key")).toBe("invalid_url");
+    expect(webhookBlockReason("https://hook.invalid/x", undefined)).toBe("missing_key");
+    expect(webhookBlockReason("https://hook.invalid/x", "  ")).toBe("missing_key");
+  });
+
+  it("does not send when the URL is not https, including an already-due alarm", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    mockFetch(() => new Response("ok", { status: 200 }));
+    const stub = queueStub(E);
+    await setWebhookEnv("http://hook.invalid/x", "fake-key");
+    await stub.sendToChief("nope-http");
+    expect(calls).toHaveLength(0);
+    expect(await meta("wh_due")).toBeNull();
+    await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO meta (k, v) VALUES ('wh_due', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+        String(Date.now() - 1),
+      );
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(await meta("wh_due")).toBeNull();
+    const joined = logs.join("\n");
+    expect(joined).toContain("non_https");
+    expect(joined).not.toContain("hook.invalid");
+    expect(joined).not.toContain("fake-key");
+    expect(joined).not.toContain("nope-http");
+  });
+
+  it("does not send when CHIEF_WEBHOOK_KEY is unset", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    mockFetch(() => new Response("ok", { status: 200 }));
+    const stub = queueStub(E);
+    await setWebhookEnv("https://hook.invalid/x", undefined);
+    await stub.sendToChief("nope-key");
+    expect(calls).toHaveLength(0);
+    expect(await meta("wh_due")).toBeNull();
+    const status = await stub.status();
+    expect(status.webhook_configured).toBe(false);
+    expect(status.webhook_url_valid).toBe(true);
+    const joined = logs.join("\n");
+    expect(joined).toContain("missing_key");
+    expect(joined).not.toContain("hook.invalid");
+    expect(joined).not.toContain("nope-key");
+  });
+
+  it("does not send an https URL that embeds userinfo", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    mockFetch(() => new Response("ok", { status: 200 }));
+    await setWebhookEnv("https://user:pass@hook.invalid/x", "fake-key");
+    await queueStub(E).sendToChief("nope-userinfo");
+    expect(calls).toHaveLength(0);
+    const joined = logs.join("\n");
+    expect(joined).toContain("invalid_url");
+    expect(joined).not.toContain("hook.invalid");
+    expect(joined).not.toContain("pass");
+    expect(joined).not.toContain("fake-key");
+  });
+});
 
 describe("webhook (immediate / spacing / retry / no stranding)", () => {
   it("has no debounce", () => {
