@@ -1,8 +1,10 @@
-import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import worker from "../src/index";
 import { CLAUDE_REDIRECT_URI } from "../src/auth-github";
+import { queueStub } from "../src/env";
+import worker, { MCP_PREAUTH_PER_MIN, MCP_RATE_PER_MIN } from "../src/index";
+import type { BoxmcpQueue } from "../src/queue";
 
 // 테스트 전용 가짜 값 (실제 secret/토큰 아님)
 const BASE = "https://chief-bridge.test";
@@ -126,13 +128,17 @@ describe("auth helpers", () => {
     expect(ownerUserId(12345678).includes(":")).toBe(false);
   });
   it("mcp user id must match the current owner", async () => {
-    const { mcpUserMatchesOwner } = await import("../src/auth-github");
+    const { mcpUserMatchesOwner, mcpActorId } = await import("../src/auth-github");
     expect(mcpUserMatchesOwner("github-12345678", "12345678")).toBe(true);
     expect(mcpUserMatchesOwner("github-12345678", " 12345678 ")).toBe(true);
     expect(mcpUserMatchesOwner("github-1", "12345678")).toBe(false);
     expect(mcpUserMatchesOwner("github-12345678", "0")).toBe(false);
     expect(mcpUserMatchesOwner(undefined, "12345678")).toBe(false);
     expect(mcpUserMatchesOwner("github-12345678", undefined)).toBe(false);
+    expect(mcpActorId({ auth: { userId: "github-12345" }, props: { githubId: 12345 } })).toBe("github-12345");
+    expect(mcpActorId({ props: { githubId: 12345 } })).toBe("github-12345");
+    expect(mcpActorId({ auth: { userId: "github-12345" } })).toBe("github-12345");
+    expect(mcpActorId({ auth: { userId: "github-1" }, props: { githubId: 12345 } })).toBeUndefined();
   });
   it("errorClass logs the class only, never the message", async () => {
     const { errorClass } = await import("../src/util");
@@ -163,6 +169,105 @@ describe("strings that deploy/verify-chief-bridge.sh greps for", () => {
     expect(a.status).toBe(400);
     expect(await a.text()).toContain("<title>chief-bridge</title>");
   });
+});
+
+/** RFC 7636 appendix B sample. Matches the code_challenge used in flow(). Not a secret. */
+const CODE_VERIFIER = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+function mcpInit(token: string): Request {
+  return new Request(`${BASE}/mcp`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      "mcp-protocol-version": "2025-06-18",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } },
+    }),
+  });
+}
+
+async function exchange(code: string): Promise<string> {
+  const res = await call(new Request(`${BASE}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: CLAUDE_REDIRECT_URI,
+      client_id: CIMD_ID,
+      code_verifier: CODE_VERIFIER,
+      resource: `${BASE}/mcp`,
+    }),
+  }));
+  const text = await res.text();
+  expect(res.status, text).toBe(200);
+  const token = (JSON.parse(text) as { access_token?: string }).access_token;
+  expect(token).toBeTruthy();
+  return token as string;
+}
+
+describe("authenticated /mcp", () => {
+  it("code exchange then /mcp is not 401, survives a full unauth bucket, and 401s after an owner change", async () => {
+    const c = await flow(12345);
+    const loc = new URL(c.headers.get("location")!);
+    const code = loc.searchParams.get("code");
+    expect(code).toBeTruthy();
+    const token = await exchange(code as string);
+    const ok = await call(mcpInit(token));
+    const okBody = await ok.text();
+    expect(ok.status, okBody).not.toBe(401);
+    expect(ok.status, okBody).not.toBe(429);
+
+    const stub = queueStub(env as never);
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      (inst as unknown as { buckets: Map<string, { count: number; resetAt: number }> }).buckets.set("mcp:unauth", {
+        count: MCP_PREAUTH_PER_MIN,
+        resetAt: Date.now() + 60_000,
+      });
+    });
+    try {
+      const anon = await call(new Request(`${BASE}/mcp`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
+      expect(anon.status).toBe(429);
+      const junk = await call(new Request(`${BASE}/mcp`, {
+        method: "POST",
+        headers: { authorization: "Bearer not-a-token", "content-type": "application/json" },
+        body: "{}",
+      }));
+      expect(junk.status).toBe(429);
+      const still = await call(mcpInit(token));
+      const stillBody = await still.text();
+      expect(still.status, stillBody).not.toBe(401);
+      expect(still.status, stillBody).not.toBe(429);
+    } finally {
+      await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+        (inst as unknown as { buckets: Map<string, unknown> }).buckets.delete("mcp:unauth");
+      });
+    }
+
+    const ctx = createExecutionContext();
+    const denied = await worker.fetch(mcpInit(token), { ...(E as object), BOXMCP_OWNER_GITHUB_ID: "999" } as never, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(denied.status).toBe(401);
+    const www = denied.headers.get("www-authenticate") ?? "";
+    expect(www).toContain(`resource_metadata="${BASE}/.well-known/oauth-protected-resource/mcp"`);
+    expect(www).toContain("invalid_token");
+
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      (inst as unknown as { buckets: Map<string, unknown> }).buckets.delete("mcp:github-12345");
+    });
+    const statuses: number[] = [];
+    for (let i = 0; i < MCP_RATE_PER_MIN + 1; i++) {
+      statuses.push((await call(mcpInit(token))).status);
+    }
+    expect(statuses.slice(0, MCP_RATE_PER_MIN).every((s) => s !== 401 && s !== 429)).toBe(true);
+    expect(statuses[MCP_RATE_PER_MIN]).toBe(429);
+  }, 30_000);
 });
 
 describe("consent POST body limit", () => {
@@ -220,5 +325,45 @@ describe("consent POST body limit", () => {
     expect(text).not.toContain("secret");
     expect(text).not.toContain("relayed");
     expect(text).not.toContain("must not leak");
+  });
+
+  it("a body of exactly the cap is accepted and a split overflow is 413", async () => {
+    const { CONSENT_MAX_BODY } = await import("../src/auth-github");
+    const exact = await call(new Request(`${BASE}/authorize`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "a".repeat(CONSENT_MAX_BODY),
+    }));
+    expect(exact.status).not.toBe(413);
+    expect(exact.status).toBeGreaterThanOrEqual(400);
+    expect(exact.status).toBeLessThan(500);
+
+    const first = new Uint8Array(4000).fill(0x61);
+    const second = new Uint8Array(CONSENT_MAX_BODY).fill(0x61);
+    let n = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (n === 0) controller.enqueue(first);
+        else if (n === 1) controller.enqueue(second);
+        else controller.close();
+        n++;
+      },
+    });
+    const overflow = await call(new Request(`${BASE}/authorize`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+    }));
+    expect(overflow.status).toBe(413);
+  });
+
+  it("malformed percent-encoding is 400", async () => {
+    const res = await call(new Request(`${BASE}/authorize`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: "handle=%ZZ&action=approve",
+    }));
+    expect(res.status).toBe(400);
+    expect(await res.text()).not.toContain("%ZZ");
   });
 });

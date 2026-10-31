@@ -123,7 +123,7 @@ npx tsc --noEmit
    npm run verify
    ```
 
-For local development, copy `.dev.vars.example` to `.dev.vars` and run `npx wrangler dev`. See step 4 for the local public origin and GitHub callback. Changing `BOXMCP_OWNER_GITHUB_ID` makes existing MCP access tokens fail on the next call (the token's user id is checked against the current value). Grants already stored in KV are not deleted; they stop being useful for `/mcp` and expire with the refresh-token TTL.
+For local development, copy `.dev.vars.example` to `.dev.vars` and run `npx wrangler dev`. See step 4 for the local public origin and GitHub callback. Changing `BOXMCP_OWNER_GITHUB_ID` makes existing MCP access tokens fail on the next call (the token's user id is checked against the current value). That 401 includes `WWW-Authenticate` with `resource_metadata`, so the client can start login again. Grants already stored in KV are not deleted; they stop being useful for `/mcp` and expire with the refresh-token TTL.
 
 ## Configuration
 
@@ -147,11 +147,12 @@ For local development, copy `.dev.vars.example` to `.dev.vars` and run `npx wran
 - **Single-owner OAuth.** The worker is its own OAuth 2.1 authorization server (`@cloudflare/workers-oauth-provider`) and uses GitHub only to prove identity: it requests no GitHub scopes, checks the numeric user id against `BOXMCP_OWNER_GITHUB_ID`, and discards the GitHub token immediately.
 - **PKCE S256** is required on the Claude.ai authorization request (the downstream leg). The GitHub login (the upstream leg) also sends S256: the verifier is stored in the OAuth provider's upstream transaction and presented only at the token exchange, not on the redirect URL.
 - Explicit consent page showing where the token will go, and `redirect_uri` pinned to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`). An error redirect is sent only when the destination's origin and path are that callback (not merely when the request's `redirect_uri` field matches).
-- Access tokens live 1 hour. `/oauth/register` is limited to 5/hour per IP. Unauthenticated `/mcp` calls share one 120/minute bucket, so a distinct `Authorization` header cannot allocate its own rate-limit entry. After the access token is validated, `/mcp` is limited to 20/minute per user id, and that user id must still equal `BOXMCP_OWNER_GITHUB_ID` (a previous owner's token is rejected). The in-memory rate-limit map refuses new keys once it holds 1024 buckets.
+- Access tokens live 1 hour. `/oauth/register` is limited to 5/hour per IP shard (256 shards from the IP hash) in a separate map. Filling those shards cannot refuse `chief`, `send_to_chief`, or authenticated MCP buckets.
+- `/mcp` requests that are not shaped like the configured owner's access token (`github-<id>:<grant>:<secret>`) share one 120/minute bucket (`mcp:unauth`). A distinct `Authorization` value does not get its own bucket. A bearer with that owner id is not charged to the bucket, so anonymous and other junk traffic cannot make the owner's calls return 429. The provider still rejects a forged token. After it accepts a real one, `/mcp` is limited to 20/minute for that user id, which must still equal `BOXMCP_OWNER_GITHUB_ID` (a previous owner's token gets 401 with `WWW-Authenticate`).
 - **Bot endpoints** need a separate bearer API key (constant-time compare, rotation via `_NEXT`).
 - **Webhook** carries only a pending count. It is sent only to an `https` URL with no embedded userinfo, and only with `CHIEF_WEBHOOK_KEY` set. Redirects are not followed.
 - Everything coming from the other side is wrapped and marked untrusted on both ends (prompt-injection hygiene). That marker does not stop a model from obeying text inside the payload; the agent instructions in setup step 7 are what keep that boundary.
-- **No secrets in the repo.** All secrets are Worker secrets; `.dev.vars`, `.env*`, and header files are gitignored. Logs record event names, paths, status codes, counts, and error class or error code. They do not include message content, exception messages, stack traces, bodies, headers, tokens, webhook URLs, keys, or query strings.
+- **No secrets in the repo.** All secrets are Worker secrets; `.dev.vars`, `.env*`, and header files are gitignored. Logs record event names, fixed route labels, status codes, counts, and error class or error code. They do not include message content, exception messages, stack traces, bodies, headers, tokens, webhook URLs, keys, raw request paths, or query strings.
 - Retention: messages are kept 30 days, at most 200 per thread and 5000 total.
 
 ## Limitations

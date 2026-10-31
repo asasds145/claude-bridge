@@ -76,6 +76,19 @@ export function mcpUserMatchesOwner(userId: string | undefined, ownerGithubId: s
   return userId === `github-${owner}`;
 }
 
+/**
+ * User id for the owner check. The provider sets both `ctx.auth.userId` (grant subject)
+ * and `ctx.props.githubId` (what completeAuthorization stored). Either is enough; if both
+ * are present and disagree, deny.
+ */
+export function mcpActorId(ctx: { auth?: { userId?: string }; props?: { githubId?: number } }): string | undefined {
+  const githubId = ctx.props?.githubId;
+  const fromProps = typeof githubId === "number" && Number.isSafeInteger(githubId) ? `github-${githubId}` : undefined;
+  const fromAuth = typeof ctx.auth?.userId === "string" && ctx.auth.userId.length > 0 ? ctx.auth.userId : undefined;
+  if (fromProps && fromAuth && fromProps !== fromAuth) return undefined;
+  return fromAuth ?? fromProps;
+}
+
 function handleAuthError(e: unknown, where: string): Response {
   if (e instanceof AuthorizationError) {
     logLine("oauth_error", { where, code: e.code });
@@ -127,6 +140,18 @@ async function authorizeGet(req: Request, env: Env): Promise<Response> {
 /** POST /authorize body cap. Enforced by reading the stream, not by trusting Content-Length. */
 export const CONSENT_MAX_BODY = 8192;
 
+/** URLSearchParams forgives bad % sequences. Reject those, and invalid UTF-8, as 400. */
+function parseConsentForm(bytes: Uint8Array): URLSearchParams {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    throw new HttpError(400, "bad body");
+  }
+  if (/%(?![0-9A-Fa-f]{2})/.test(text)) throw new HttpError(400, "bad body");
+  return new URLSearchParams(text);
+}
+
 function bytesToBase64Url(bytes: Uint8Array): string {
   let s = "";
   for (const b of bytes) s += String.fromCharCode(b);
@@ -149,7 +174,7 @@ async function authorizePost(req: Request, env: Env): Promise<Response> {
   try {
     // Cap the bytes actually read. A missing or small Content-Length must not unlock a larger body.
     const bytes = await readBodyLimited(req, CONSENT_MAX_BODY);
-    const form = new URLSearchParams(new TextDecoder().decode(bytes));
+    const form = parseConsentForm(bytes);
     handle = form.get("handle") ?? "";
     action = form.get("action") ?? "";
   } catch (e) {

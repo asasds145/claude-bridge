@@ -136,7 +136,19 @@ export function errorClass(e: unknown): string {
   return typeof e;
 }
 
-/** Logs: event, path, status, counts, error class/code. No message body, stack, header, token, URL, or query. */
+const CHIEF_ROUTES = new Set(["/chief/health", "/chief/inbox", "/chief/reply", "/chief/ack", "/chief/send"]);
+
+/** Fixed log label. Never the raw path: it is attacker-controlled and may contain a token or key. */
+export function routeLabel(pathname: string): string {
+  if (pathname === "/" || pathname === "/health") return pathname;
+  if (pathname === "/mcp" || pathname.startsWith("/mcp/")) return "/mcp";
+  if (pathname === "/authorize" || pathname === "/callback" || pathname === "/oauth/token" || pathname === "/oauth/register") return pathname;
+  if (CHIEF_ROUTES.has(pathname)) return pathname;
+  if (pathname.startsWith("/.well-known/")) return "/.well-known";
+  return "unknown_route";
+}
+
+/** Logs: event, route label, status, counts, error class/code. No message body, stack, header, token, URL, raw path, or query. */
 export function logLine(event: string, fields: Record<string, string | number | boolean> = {}): void {
   console.log(JSON.stringify({ event, ...fields }));
 }

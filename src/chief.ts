@@ -1,5 +1,5 @@
 import { type Env, queueStub } from "./env";
-import { HttpError, MAX_TEXT, THREAD_ID_RE, json, logLine, readJsonLimited, safeEqual, type StoredMessage } from "./util";
+import { HttpError, MAX_TEXT, THREAD_ID_RE, json, logLine, readJsonLimited, routeLabel, safeEqual, type StoredMessage } from "./util";
 
 export const CHIEF_RATE_PER_MIN = 60;
 
@@ -32,8 +32,9 @@ function validText(v: unknown): string {
 export async function handleChief(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const path = url.pathname;
+  const route = routeLabel(path);
   if (!(await checkChiefKey(req, env))) {
-    logLine("chief", { path, status: 401 });
+    logLine("chief", { route, status: 401 });
     return json({ error: "unauthorized" }, 401, { "www-authenticate": 'Bearer realm="chief-bridge-chief"' });
   }
   const stub = queueStub(env);
@@ -76,10 +77,10 @@ export async function handleChief(req: Request, env: Env): Promise<Response> {
     return json({ error: "not_found" }, 404);
   } catch (e) {
     if (e instanceof HttpError) {
-      logLine("chief", { path, status: e.status });
+      logLine("chief", { route, status: e.status });
       return json({ error: e.message }, e.status);
     }
-    logLine("chief", { path, status: 500 });
+    logLine("chief", { route, status: 500 });
     return json({ error: "internal_error" }, 500);
   }
 }

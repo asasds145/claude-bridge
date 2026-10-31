@@ -14,8 +14,13 @@ export const WEBHOOK_MAX_PER_HOUR = 60;
 export const WEBHOOK_RETRY_MS = [1, 5, 15].map((m) => m * 60 * 1000);
 export const CLEANUP_INTERVAL_MS = 6 * 3600 * 1000;
 export const MAX_WAITERS = 10;
-/** Hard cap so unauthenticated callers cannot grow the in-memory map without bound. */
-export const MAX_RATE_BUCKETS = 1024;
+/**
+ * Cap for outsider-creatable buckets only (registration shards).
+ * Trusted keys live in a different map, so filling this one cannot refuse them.
+ */
+export const MAX_PUBLIC_BUCKETS = 256;
+/** Registration is one bucket per hash shard, not per raw address. 2 hex chars = 256 shards. */
+export const REGISTER_SHARD_HEX = 2;
 const HOUR = 3600 * 1000;
 
 export type WebhookBlockReason = "non_https" | "invalid_url" | "missing_key";
@@ -61,7 +66,10 @@ export interface WaitResult {
 export class BoxmcpQueue extends DurableObject<Env> {
   private sql: SqlStorage;
   private waiters = new Set<Waiter>();
+  /** Server-chosen keys only: chief, send_to_chief, mcp user, shared unauth bucket. */
   private buckets = new Map<string, { count: number; resetAt: number }>();
+  /** Keys an unauthenticated caller can multiply (registration shards). Capped separately. */
+  private publicBuckets = new Map<string, { count: number; resetAt: number }>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -106,23 +114,35 @@ export class BoxmcpQueue extends DurableObject<Env> {
   }
 
   // ---------- rate limit (DO 메모리; eviction 시 초기화) ----------
-  // New keys are refused once the map is full (after dropping expired entries). Callers that
-  // have not authenticated must use a fixed key, not one derived from an untrusted header.
+  // Trusted keys are not capped by the public map. Outsider-creatable keys use rateLimitPublic.
   async rateLimit(key: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
+    return this.limitIn(this.buckets, key, limit, windowMs, Number.POSITIVE_INFINITY);
+  }
+
+  async rateLimitPublic(key: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
+    return this.limitIn(this.publicBuckets, key, limit, windowMs, MAX_PUBLIC_BUCKETS);
+  }
+
+  private limitIn(
+    map: Map<string, { count: number; resetAt: number }>,
+    key: string,
+    limit: number,
+    windowMs: number,
+    maxKeys: number,
+  ): { ok: boolean; retryAfter: number } {
     const now = Date.now();
-    const existing = this.buckets.get(key);
+    const existing = map.get(key);
     if (!existing || existing.resetAt <= now) {
       const reusesSlot = existing !== undefined && existing.resetAt <= now;
-      if (!reusesSlot && this.buckets.size >= MAX_RATE_BUCKETS) {
-        for (const [k, v] of this.buckets) if (v.resetAt <= now) this.buckets.delete(k);
+      if (!reusesSlot && map.size >= maxKeys) {
+        for (const [k, v] of map) if (v.resetAt <= now) map.delete(k);
       }
-      if (!this.buckets.has(key) && this.buckets.size >= MAX_RATE_BUCKETS) {
+      if (!map.has(key) && map.size >= maxKeys) {
         let soonest = now + windowMs;
-        for (const v of this.buckets.values()) if (v.resetAt < soonest) soonest = v.resetAt;
+        for (const v of map.values()) if (v.resetAt < soonest) soonest = v.resetAt;
         return { ok: false, retryAfter: Math.max(1, Math.ceil((soonest - now) / 1000)) };
       }
-      const fresh = { count: 1, resetAt: now + windowMs };
-      this.buckets.set(key, fresh);
+      map.set(key, { count: 1, resetAt: now + windowMs });
       return { ok: true, retryAfter: 0 };
     }
     if (existing.count >= limit) return { ok: false, retryAfter: Math.ceil((existing.resetAt - now) / 1000) };
@@ -338,6 +358,11 @@ export class BoxmcpQueue extends DurableObject<Env> {
     if (blocked) {
       // Reason code only. The URL and key are operator secrets and must not be logged.
       logLine("webhook_skipped", { reason: blocked });
+      // Drop a schedule that was created under a previously valid config. Keep the cleanup alarm.
+      if (this.getMeta("wh_due") !== null || this.getMeta("wh_attempt") !== null || this.getMeta("wh_chain_wm") !== null) {
+        this.clearWebhook();
+        await this.rearm();
+      }
       return;
     }
     if (!this.env.CHIEF_WEBHOOK_URL) return;
