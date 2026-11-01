@@ -39,7 +39,8 @@ function render(msgs: StoredMessage[], empty: string): string {
 export function createServer(): McpServer {
   const env = workerEnv as unknown as Env;
   const server = new McpServer(
-    { name: "chief-bridge", version: "0.1.0" },
+    // Keep in sync with package.json "version".
+    { name: "chief-bridge", version: "1.0.0" },
     {
       instructions: SERVER_INSTRUCTIONS,
     },
@@ -140,7 +141,9 @@ export function createServer(): McpServer {
     "get_thread",
     {
       title: "Get thread",
-      description: "Get every retained message in a thread (both directions).",
+      description:
+        "List retained messages in a thread. Chief replies include their text. " +
+        "Messages you sent to Chief are returned as metadata only (id and time), not the original text.",
       inputSchema: z.object({ thread_id: threadId }),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },

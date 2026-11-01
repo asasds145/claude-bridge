@@ -2,8 +2,9 @@
 import { createExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { createMcpHandler } from "agents/mcp/server";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "../src/mcp";
+import { resetSharedDurableState } from "./isolate";
 
 const handler = createMcpHandler(createServer, { route: "/mcp", allowedHostnames: ["chief-bridge.test"], corsOptions: false });
 let n = 0;
@@ -22,6 +23,8 @@ async function rpc(method: string, params: unknown) {
   return { status: res.status, json: JSON.parse(dataLine ? dataLine.slice(5) : body) };
 }
 const call = (name: string, args: unknown) => rpc("tools/call", { name, arguments: args });
+
+beforeEach(() => resetSharedDurableState());
 
 describe("MCP tools", () => {
   it("tools/list has the 5 tools with annotations", async () => {
@@ -67,6 +70,7 @@ describe("MCP tools", () => {
   });
   it("initialize returns loop instructions; send_to_chief result tells Claude to keep waiting", async () => {
     const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } });
+    expect(init.json.result.serverInfo.version).toBe("1.0.0");
     const ins = init.json.result.instructions as string;
     expect(ins).toContain("wait_for_reply");
     expect(ins).toContain("read_chief_replies");

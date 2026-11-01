@@ -19,6 +19,12 @@ export interface Env {
   CHIEF_WEBHOOK_KEY?: string;
   BOXMCP_CHIEF_API_KEY?: string;
   BOXMCP_CHIEF_API_KEY_NEXT?: string;
+
+  /**
+   * Workers Rate Limiting binding (`ratelimits` in wrangler).
+   * Optional at runtime: a missing binding fails open so a config mismatch cannot lock the owner out.
+   */
+  MCP_IP_LIMITER?: RateLimit;
 }
 
 export const QUEUE_NAME = "main";

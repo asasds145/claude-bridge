@@ -1,7 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
-import { logLine, stripControl, type StoredMessage } from "./util";
-import { errorSummary } from "./auth-github";
+import { errorClass, logLine, stripControl, type StoredMessage } from "./util";
 
 export const RETENTION_MS = 30 * 24 * 3600 * 1000;
 export const MAX_PER_THREAD = 200;
@@ -15,7 +14,54 @@ export const WEBHOOK_MAX_PER_HOUR = 60;
 export const WEBHOOK_RETRY_MS = [1, 5, 15].map((m) => m * 60 * 1000);
 export const CLEANUP_INTERVAL_MS = 6 * 3600 * 1000;
 export const MAX_WAITERS = 10;
+/**
+ * Cap for outsider-creatable buckets only (registration shards).
+ * Trusted keys live in a different map, so filling this one cannot refuse them.
+ */
+export const MAX_PUBLIC_BUCKETS = 256;
+/** Registration is one bucket per hash shard, not per raw address. 2 hex chars = 256 shards. */
+export const REGISTER_SHARD_HEX = 2;
+/** Library grant ids are 16 characters from this alphabet (workers-oauth-provider 1.2.4). */
+export const ACCEPTED_GRANT_RE = /^[A-Za-z0-9_-]{16}$/;
+/** Owner grants only. Attackers cannot insert rows. Oldest rows past this cap are dropped. */
+export const MAX_ACCEPTED_GRANTS = 32;
+/** When mcp:forge is full, one unknown owner-shaped token may still be looked up this often. */
+export const FORGE_TRICKLE_MS = 5_000;
+/** Skip a SQLite rewrite when this grant was already stored more recently than this. */
+export const GRANT_TOUCH_MS = 60_000;
+/**
+ * Same duration as refreshTokenTTL. A row older than this cannot still be a live refresh grant.
+ * index.ts re-exports it in seconds for the OAuth provider.
+ */
+export const GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const HOUR = 3600 * 1000;
+
+export type ForgeReservation =
+  | { action: "known"; retryAfter: 0 }
+  | { action: "reserved"; refundable: boolean; retryAfter: number; resetAt: number }
+  | { action: "deny"; retryAfter: number };
+
+export type WebhookBlockReason = "non_https" | "invalid_url" | "missing_key";
+
+/**
+ * Why a webhook must not be sent, or null when it is safe to send.
+ * An unset URL is "not configured" (null), not an error: nothing is woken and nothing is logged.
+ * Non-https is refused so the bearer key is never sent in cleartext. Embedded userinfo is refused
+ * because it is another credential on the request line.
+ */
+export function webhookBlockReason(url: string | undefined, key: string | undefined): WebhookBlockReason | null {
+  if (!url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "invalid_url";
+  }
+  if (parsed.protocol !== "https:") return "non_https";
+  if (parsed.username !== "" || parsed.password !== "" || parsed.hostname === "") return "invalid_url";
+  if (!key?.trim()) return "missing_key";
+  return null;
+}
 
 type Waiter = {
   token?: string;
@@ -38,7 +84,17 @@ export interface WaitResult {
 export class BoxmcpQueue extends DurableObject<Env> {
   private sql: SqlStorage;
   private waiters = new Set<Waiter>();
+  /** Server-chosen keys only: chief, send_to_chief, mcp user, shared unauth/forge buckets. */
   private buckets = new Map<string, { count: number; resetAt: number }>();
+  /** Last time an over-cap forge lookup was admitted. In-memory; the accepted-grant table is what survives eviction. */
+  private forgeTrickleAt = Date.now();
+  /**
+   * One-shot fault for tests, set only from inside the isolate. No request path writes it.
+   * Cleared when it fires so a later call is not stuck failing.
+   */
+  __testFaultOnce: "releaseForge" | "ownerAccepted" | "reserveForge" | "rateLimit" | "rateLimitPublic" | null = null;
+  /** Keys an unauthenticated caller can multiply (registration shards). Capped separately. */
+  private publicBuckets = new Map<string, { count: number; resetAt: number }>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -55,6 +111,8 @@ export class BoxmcpQueue extends DurableObject<Env> {
       this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_thread ON messages(thread_id, id)`);
       this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_dir ON messages(direction, acked, id)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`);
+      // Grant ids the owner check has accepted. A refresh keeps the same grant id, so one row covers every access token for that login.
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS accepted_grants (grant_id TEXT PRIMARY KEY, seen_at INTEGER NOT NULL)`);
       if (this.getMeta("cleanup_due") === null) {
         this.setMeta("cleanup_due", String(Date.now() + CLEANUP_INTERVAL_MS));
       }
@@ -83,18 +141,150 @@ export class BoxmcpQueue extends DurableObject<Env> {
   }
 
   // ---------- rate limit (DO 메모리; eviction 시 초기화) ----------
+  // Trusted keys are not capped by the public map. Outsider-creatable keys use rateLimitPublic.
   async rateLimit(key: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
+    this.throwIfFault("rateLimit");
+    return this.limitIn(this.buckets, key, limit, windowMs, Number.POSITIVE_INFINITY);
+  }
+
+  async rateLimitPublic(key: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
+    this.throwIfFault("rateLimitPublic");
+    return this.limitIn(this.publicBuckets, key, limit, windowMs, MAX_PUBLIC_BUCKETS);
+  }
+
+  /**
+   * One RPC for an accepted owner call: record the grant, then apply the per-user limit.
+   * A grant-write failure is logged and does not fail the RPC, so the caller still rate-limits and answers.
+   */
+  async ownerAccepted(grantId: string, rateKey: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
+    this.throwIfFault("ownerAccepted");
+    if (grantId) {
+      try {
+        await this.rememberOwnerGrant(grantId);
+      } catch (e) {
+        logLine("grant_record", { error_class: errorClass(e) });
+      }
+    }
+    return this.rateLimit(rateKey, limit, windowMs);
+  }
+
+  /**
+   * Serialized by the Durable Object input gate, so a parallel burst cannot reserve more than `limit` lookups.
+   * A stored grant skips this budget. There is no shared pre-validation bucket: one known grant id must not
+   * be able to lock out the owner. Per-address KV lookups are bounded by the IP limiter instead.
+   * seen_at is not touched here.
+   */
+  async reserveForge(grantId: string, limit: number, windowMs: number): Promise<ForgeReservation> {
+    this.throwIfFault("reserveForge");
+    if (ACCEPTED_GRANT_RE.test(grantId) && this.ownerGrantKnown(grantId)) {
+      return { action: "known", retryAfter: 0 };
+    }
     const now = Date.now();
-    let b = this.buckets.get(key);
+    let b = this.buckets.get("mcp:forge");
     if (!b || b.resetAt <= now) {
       b = { count: 0, resetAt: now + windowMs };
-      this.buckets.set(key, b);
+      this.buckets.set("mcp:forge", b);
     }
-    if (this.buckets.size > 10000) {
-      for (const [k, v] of this.buckets) if (v.resetAt <= now) this.buckets.delete(k);
+    const retryAfter = Math.max(1, Math.ceil((b.resetAt - now) / 1000));
+    if (b.count < limit) {
+      b.count++;
+      return { action: "reserved", refundable: true, retryAfter, resetAt: b.resetAt };
     }
-    if (b.count >= limit) return { ok: false, retryAfter: Math.ceil((b.resetAt - now) / 1000) };
-    b.count++;
+    // One lookup when the cap is full. It does not add a slot that can be refunded.
+    if (now - this.forgeTrickleAt >= FORGE_TRICKLE_MS) {
+      this.forgeTrickleAt = now;
+      return { action: "reserved", refundable: false, retryAfter, resetAt: b.resetAt };
+    }
+    return { action: "deny", retryAfter };
+  }
+
+  /**
+   * Return a cap slot only if that reservation's window is still the current one.
+   * A refund from an earlier window must not credit the window that replaced it.
+   */
+  async releaseForge(resetAt: number): Promise<void> {
+    this.throwIfFault("releaseForge");
+    const b = this.buckets.get("mcp:forge");
+    if (!b || b.resetAt !== resetAt || b.count <= 0) return;
+    b.count--;
+  }
+
+  /**
+   * Record a grant after token issuance for the current owner, or after /mcp owner check.
+   * Skips the write when the row is already newer than GRANT_TOUCH_MS.
+   */
+  async rememberOwnerGrant(grantId: string): Promise<void> {
+    if (!ACCEPTED_GRANT_RE.test(grantId)) return;
+    const now = Date.now();
+    // Drop expired rows even when this grant's own write is skipped, so a read of a fresh row still ages the table out.
+    this.pruneExpiredGrants(now, grantId);
+    const existing = this.sql.exec<{ seen_at: number }>(`SELECT seen_at FROM accepted_grants WHERE grant_id = ?`, grantId).toArray();
+    if (existing.length && now - Number(existing[0].seen_at) < GRANT_TOUCH_MS) return;
+    this.sql.exec(
+      `INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?) ON CONFLICT(grant_id) DO UPDATE SET seen_at = excluded.seen_at`,
+      grantId,
+      now,
+    );
+    // Always keep the row just written. An UPDATE does not change rowid, so a tie on seen_at
+    // ordered only by rowid could otherwise evict it. Among the rest, higher rowid wins a tie.
+    this.sql.exec(
+      `DELETE FROM accepted_grants
+       WHERE grant_id <> ?
+         AND grant_id NOT IN (
+           SELECT grant_id FROM accepted_grants
+           WHERE grant_id <> ?
+           ORDER BY seen_at DESC, rowid DESC
+           LIMIT ?
+         )`,
+      grantId,
+      grantId,
+      MAX_ACCEPTED_GRANTS - 1,
+    );
+  }
+
+  private ownerGrantKnown(grantId: string): boolean {
+    // An expired row must not keep skipping mcp:forge. This read deletes it.
+    this.pruneExpiredGrants(Date.now());
+    return this.sql.exec(`SELECT 1 AS n FROM accepted_grants WHERE grant_id = ? LIMIT 1`, grantId).toArray().length > 0;
+  }
+
+  /** Delete grants older than the refresh lifetime. `keepId` is the row this call is about to write. */
+  private pruneExpiredGrants(now: number, keepId?: string): void {
+    const cutoff = now - GRANT_TTL_MS;
+    if (keepId) this.sql.exec(`DELETE FROM accepted_grants WHERE seen_at < ? AND grant_id <> ?`, cutoff, keepId);
+    else this.sql.exec(`DELETE FROM accepted_grants WHERE seen_at < ?`, cutoff);
+  }
+
+  private throwIfFault(op: NonNullable<BoxmcpQueue["__testFaultOnce"]>): void {
+    if (this.__testFaultOnce !== op) return;
+    this.__testFaultOnce = null;
+    throw new Error("do-fault");
+  }
+
+  private limitIn(
+    map: Map<string, { count: number; resetAt: number }>,
+    key: string,
+    limit: number,
+    windowMs: number,
+    maxKeys: number,
+  ): { ok: boolean; retryAfter: number } {
+    const now = Date.now();
+    const existing = map.get(key);
+    if (!existing || existing.resetAt <= now) {
+      const reusesSlot = existing !== undefined && existing.resetAt <= now;
+      if (!reusesSlot && map.size >= maxKeys) {
+        for (const [k, v] of map) if (v.resetAt <= now) map.delete(k);
+      }
+      if (!map.has(key) && map.size >= maxKeys) {
+        let soonest = now + windowMs;
+        for (const v of map.values()) if (v.resetAt < soonest) soonest = v.resetAt;
+        return { ok: false, retryAfter: Math.max(1, Math.ceil((soonest - now) / 1000)) };
+      }
+      map.set(key, { count: 1, resetAt: now + windowMs });
+      return { ok: true, retryAfter: 0 };
+    }
+    if (existing.count >= limit) return { ok: false, retryAfter: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)) };
+    existing.count++;
     return { ok: true, retryAfter: 0 };
   }
 
@@ -278,8 +468,9 @@ export class BoxmcpQueue extends DurableObject<Env> {
       last_to_chief_at: lastC,
       last_to_claude_at: lastR,
       waiters: this.waiters.size,
-      webhook_configured: Boolean(this.env.CHIEF_WEBHOOK_URL),
-      webhook_url_valid: (() => { try { const u = new URL(this.env.CHIEF_WEBHOOK_URL ?? ""); return u.protocol === "https:"; } catch { return false; } })(),
+      webhook_configured: webhookBlockReason(this.env.CHIEF_WEBHOOK_URL, this.env.CHIEF_WEBHOOK_KEY) === null && Boolean(this.env.CHIEF_WEBHOOK_URL),
+      // A placeholder key so "missing key" is not reported as an invalid URL.
+      webhook_url_valid: webhookBlockReason(this.env.CHIEF_WEBHOOK_URL, "set") === null && Boolean(this.env.CHIEF_WEBHOOK_URL),
       webhook_scheduled: this.getMeta("wh_due") !== null,
     };
   }
@@ -300,8 +491,26 @@ export class BoxmcpQueue extends DurableObject<Env> {
     return t;
   }
 
+  /** Drop wh_due / wh_attempt / wh_chain_wm and keep the cleanup alarm. No-op if nothing is scheduled. */
+  private async dropWebhookSchedule(): Promise<void> {
+    if (this.getMeta("wh_due") === null && this.getMeta("wh_attempt") === null && this.getMeta("wh_chain_wm") === null) return;
+    this.clearWebhook();
+    await this.rearm();
+  }
+
   private async scheduleWebhook(): Promise<void> {
-    if (!this.env.CHIEF_WEBHOOK_URL) return;
+    // Unset URL is "webhooks off", not a bad URL. Still drop a schedule left over from a previous config.
+    if (!this.env.CHIEF_WEBHOOK_URL) {
+      await this.dropWebhookSchedule();
+      return;
+    }
+    const blocked = webhookBlockReason(this.env.CHIEF_WEBHOOK_URL, this.env.CHIEF_WEBHOOK_KEY);
+    if (blocked) {
+      // Reason code only. The URL and key are operator secrets and must not be logged.
+      logLine("webhook_skipped", { reason: blocked });
+      await this.dropWebhookSchedule();
+      return;
+    }
     if (this.getMeta("wh_due") !== null) {
       // 이미 예약됨(또는 발사 중) → 합침. 발사 중에 도착한 메시지는 runWebhook이 id watermark로 감지해 후속 예약.
       return;
@@ -327,6 +536,12 @@ export class BoxmcpQueue extends DurableObject<Env> {
   }
 
   private async runWebhook(now: number): Promise<void> {
+    const blocked = webhookBlockReason(this.env.CHIEF_WEBHOOK_URL, this.env.CHIEF_WEBHOOK_KEY);
+    if (blocked) {
+      logLine("webhook_skipped", { reason: blocked });
+      this.clearWebhook();
+      return;
+    }
     const url = this.env.CHIEF_WEBHOOK_URL;
     const pending = this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM messages WHERE direction='to_chief' AND acked=0`).one().n;
     if (!url || pending === 0) {
@@ -349,11 +564,12 @@ export class BoxmcpQueue extends DurableObject<Env> {
     let ok = false;
     try {
       const headers = new Headers({ "content-type": "application/json" });
-      if (this.env.CHIEF_WEBHOOK_KEY) {
-        const name = this.env.CHIEF_WEBHOOK_AUTH_HEADER || "Authorization";
-        const scheme = this.env.CHIEF_WEBHOOK_AUTH_SCHEME;
-        headers.set(name, scheme ? `${scheme} ${this.env.CHIEF_WEBHOOK_KEY}` : this.env.CHIEF_WEBHOOK_KEY);
-      }
+      // webhookBlockReason already required a non-empty key. Unset scheme defaults to Bearer;
+      // an explicit empty scheme sends the raw key (wrangler.jsonc sets Bearer).
+      const key = this.env.CHIEF_WEBHOOK_KEY as string;
+      const name = this.env.CHIEF_WEBHOOK_AUTH_HEADER || "Authorization";
+      const scheme = this.env.CHIEF_WEBHOOK_AUTH_SCHEME ?? "Bearer";
+      headers.set(name, scheme ? `${scheme} ${key}` : key);
       const res = await fetch(url, {
         method: "POST",
         headers,
@@ -365,8 +581,8 @@ export class BoxmcpQueue extends DurableObject<Env> {
       await res.body?.cancel();
       logLine("webhook", { status: res.status });
     } catch (e) {
-      const { err_name, err_message } = errorSummary(e);
-      logLine("webhook", { status: "error", err_name, err_message: err_message.replace(/https?:\/\/\S+/gi, "[url]") });
+      // Fetch errors often embed the destination URL in the message. Log the class only.
+      logLine("webhook", { status: "error", err_name: errorClass(e) });
     }
 
     if (ok) {

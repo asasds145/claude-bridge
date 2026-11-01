@@ -3,10 +3,11 @@ import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { queueStub } from "../src/env";
-import { WEBHOOK_DEBOUNCE_MS, WEBHOOK_MIN_GAP_MS, type BoxmcpQueue } from "../src/queue";
+import { WEBHOOK_DEBOUNCE_MS, WEBHOOK_MIN_GAP_MS, webhookBlockReason, type BoxmcpQueue } from "../src/queue";
+import { resetSharedDurableState } from "./isolate";
 
 const E = env as unknown as Env;
-type Call = { url: string; body: string; auth: string | null };
+type Call = { url: string; body: string; auth: string | null; redirect: string | null };
 
 async function until(pred: () => boolean | Promise<boolean>, ms = 3000): Promise<void> {
   const end = Date.now() + ms;
@@ -25,12 +26,18 @@ let calls: Call[];
 function mockFetch(impl: () => Promise<Response> | Response) {
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
     const req = new Request(input as RequestInfo, init as RequestInit);
-    calls.push({ url: req.url, body: await req.text(), auth: req.headers.get("authorization") });
+    calls.push({
+      url: req.url,
+      body: await req.text(),
+      auth: req.headers.get("authorization"),
+      redirect: (init as RequestInit | undefined)?.redirect ?? null,
+    });
     return impl();
   });
 }
 
 beforeEach(async () => {
+  await resetSharedDurableState();
   calls = [];
   // 테스트 전용 가짜 webhook 설정 (실제 URL/secret 아님) + 깨끗한 webhook 상태
   await runInDurableObject(queueStub(E), (inst: BoxmcpQueue, state) => {
@@ -39,7 +46,197 @@ beforeEach(async () => {
     state.storage.sql.exec(`DELETE FROM meta WHERE k IN ('wh_due','wh_attempt','wh_sends','wh_chain_wm')`);
   });
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await runInDurableObject(queueStub(E), (inst: BoxmcpQueue) => {
+    (inst as unknown as { env: Env }).env = E;
+  });
+});
+
+function setWebhookEnv(url: string | undefined, key: string | undefined, scheme?: string) {
+  return runInDurableObject(queueStub(E), (inst: BoxmcpQueue) => {
+    const next: Env = { ...E, CHIEF_WEBHOOK_URL: url, CHIEF_WEBHOOK_KEY: key };
+    if (scheme !== undefined) next.CHIEF_WEBHOOK_AUTH_SCHEME = scheme;
+    (inst as unknown as { env: Env }).env = next;
+  });
+}
+
+describe("webhook destination guards", () => {
+  it("classifies https, non-https, userinfo, and a missing key without echoing them", () => {
+    expect(webhookBlockReason(undefined, undefined)).toBeNull();
+    expect(webhookBlockReason("https://hook.invalid/x", "fake-key")).toBeNull();
+    expect(webhookBlockReason("http://hook.invalid/x", "fake-key")).toBe("non_https");
+    expect(webhookBlockReason("https://user:pass@hook.invalid/x", "fake-key")).toBe("invalid_url");
+    expect(webhookBlockReason("not a url", "fake-key")).toBe("invalid_url");
+    expect(webhookBlockReason("https://hook.invalid/x", undefined)).toBe("missing_key");
+    expect(webhookBlockReason("https://hook.invalid/x", "  ")).toBe("missing_key");
+  });
+
+  it("does not send when the URL is not https, including an already-due alarm", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    mockFetch(() => new Response("ok", { status: 200 }));
+    const stub = queueStub(E);
+    await setWebhookEnv("http://hook.invalid/x", "fake-key");
+    await stub.sendToChief("nope-http");
+    expect(calls).toHaveLength(0);
+    expect(await meta("wh_due")).toBeNull();
+    await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      state.storage.sql.exec(
+        `INSERT INTO meta (k, v) VALUES ('wh_due', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+        String(Date.now() - 1),
+      );
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(await meta("wh_due")).toBeNull();
+    const joined = logs.join("\n");
+    expect(joined).toContain("non_https");
+    expect(joined).not.toContain("hook.invalid");
+    expect(joined).not.toContain("fake-key");
+    expect(joined).not.toContain("nope-http");
+  });
+
+  it("does not send when CHIEF_WEBHOOK_KEY is unset", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    mockFetch(() => new Response("ok", { status: 200 }));
+    const stub = queueStub(E);
+    await setWebhookEnv("https://hook.invalid/x", undefined);
+    await stub.sendToChief("nope-key");
+    expect(calls).toHaveLength(0);
+    expect(await meta("wh_due")).toBeNull();
+    const status = await stub.status();
+    expect(status.webhook_configured).toBe(false);
+    expect(status.webhook_url_valid).toBe(true);
+    const joined = logs.join("\n");
+    expect(joined).toContain("missing_key");
+    expect(joined).not.toContain("hook.invalid");
+    expect(joined).not.toContain("nope-key");
+  });
+
+  it("does not send an https URL that embeds userinfo", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    mockFetch(() => new Response("ok", { status: 200 }));
+    await setWebhookEnv("https://user:pass@hook.invalid/x", "fake-key");
+    await queueStub(E).sendToChief("nope-userinfo");
+    expect(calls).toHaveLength(0);
+    const joined = logs.join("\n");
+    expect(joined).toContain("invalid_url");
+    expect(joined).not.toContain("hook.invalid");
+    expect(joined).not.toContain("pass");
+    expect(joined).not.toContain("fake-key");
+  });
+
+  it("clears a future webhook schedule when the config becomes invalid", async () => {
+    const stub = queueStub(E);
+    const future = Date.now() + 60_000;
+    await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_due', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, String(future));
+      state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_attempt', '2') ON CONFLICT(k) DO UPDATE SET v = excluded.v`);
+      state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_chain_wm', '9') ON CONFLICT(k) DO UPDATE SET v = excluded.v`);
+    });
+    await setWebhookEnv("http://hook.invalid/x", "fake-key");
+    await stub.sendToChief("stale-schedule");
+    expect(await meta("wh_due")).toBeNull();
+    expect(await meta("wh_attempt")).toBeNull();
+    expect(await meta("wh_chain_wm")).toBeNull();
+    expect(await meta("cleanup_due")).not.toBeNull();
+    const alarm = await runInDurableObject(stub, async (_inst: BoxmcpQueue, state) => state.storage.getAlarm());
+    expect(alarm).toBe(Number(await meta("cleanup_due")));
+  });
+
+  it("clears a schedule when the webhook URL is removed", async () => {
+    mockFetch(() => new Response("ok", { status: 200 }));
+    const stub = queueStub(E);
+    await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_due', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, String(Date.now() + 60_000));
+      state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_attempt', '2') ON CONFLICT(k) DO UPDATE SET v = excluded.v`);
+      state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_chain_wm', '4') ON CONFLICT(k) DO UPDATE SET v = excluded.v`);
+    });
+    await setWebhookEnv(undefined, undefined);
+    await stub.sendToChief("url-removed");
+    expect(await meta("wh_due")).toBeNull();
+    expect(await meta("wh_attempt")).toBeNull();
+    expect(await meta("wh_chain_wm")).toBeNull();
+    expect(await meta("cleanup_due")).not.toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("a due alarm with a missing key or userinfo URL does not fetch", async () => {
+    mockFetch(() => new Response("ok", { status: 200 }));
+    const stub = queueStub(E);
+    const arm = async (url: string, key: string | undefined) => {
+      await setWebhookEnv(url, key);
+      await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+        state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_due', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, String(Date.now() - 1));
+        state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_attempt', '1') ON CONFLICT(k) DO UPDATE SET v = excluded.v`);
+        state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_chain_wm', '3') ON CONFLICT(k) DO UPDATE SET v = excluded.v`);
+      });
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+    };
+    await arm("https://hook.invalid/x", undefined);
+    await arm("https://user:pass@hook.invalid/x", "fake-key");
+    expect(calls).toHaveLength(0);
+    expect(await meta("wh_due")).toBeNull();
+    expect(await meta("wh_attempt")).toBeNull();
+    expect(await meta("wh_chain_wm")).toBeNull();
+  });
+
+  it("does not follow webhook redirects", async () => {
+    mockFetch(() => new Response(null, { status: 302, headers: { location: "https://hook.invalid/other" } }));
+    const stub = queueStub(E);
+    await stub.sendToChief("redir");
+    await until(() => calls.length === 1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://hook.invalid/x");
+    expect(calls[0].redirect).toBe("manual");
+    await until(async () => (await meta("wh_attempt")) === "1");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("unset scheme defaults to Bearer and an empty scheme sends the raw key", async () => {
+    mockFetch(() => new Response("ok", { status: 200 }));
+    const stub = queueStub(E);
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      const next: Env = { ...E, CHIEF_WEBHOOK_URL: "https://hook.invalid/x", CHIEF_WEBHOOK_KEY: "fake-key" };
+      delete next.CHIEF_WEBHOOK_AUTH_SCHEME;
+      (inst as unknown as { env: Env }).env = next;
+    });
+    await stub.sendToChief("scheme-default");
+    await until(() => calls.length === 1);
+    expect(calls[0].auth).toBe("Bearer fake-key");
+    await until(async () => (await stub.status()).webhook_scheduled === false);
+    await setWebhookEnv("https://hook.invalid/x", "fake-key", "");
+    await stub.sendToChief("scheme-empty");
+    await until(() => calls.length === 2, WEBHOOK_MIN_GAP_MS + 4000);
+    expect(calls[1].auth).toBe("fake-key");
+  }, 20_000);
+
+  it("a fetch exception does not log the URL", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      throw new TypeError("connect failed https://hook.invalid/secret-path");
+    });
+    await queueStub(E).sendToChief("boom-url");
+    await until(() => logs.some((l) => l.includes("webhook")));
+    const joined = logs.join("\n");
+    expect(joined).toContain("TypeError");
+    expect(joined).not.toContain("hook.invalid");
+    expect(joined).not.toContain("secret-path");
+    expect(joined).not.toContain("boom-url");
+  });
+});
 
 describe("webhook (immediate / spacing / retry / no stranding)", () => {
   it("has no debounce", () => {

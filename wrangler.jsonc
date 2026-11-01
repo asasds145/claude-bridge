@@ -14,6 +14,18 @@
     // `npx wrangler kv namespace create OAUTH_KV` and paste the id here
     { "binding": "OAUTH_KV", "id": "<YOUR_KV_NAMESPACE_ID>" }
   ],
+  // IP ceiling in front of /mcp and POST /oauth/register. Takes effect on the next deploy.
+  // namespace_id is an app-chosen positive integer below 2^31, with no other meaning. It is not an account id.
+  // Bindings that share a namespace_id share counters across every Worker in the account, so this
+  // value must be unique among Workers in the account.
+  // 600/min is 30x the owner's 20/min cap. https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+  "ratelimits": [
+    {
+      "name": "MCP_IP_LIMITER",
+      "namespace_id": "739184625",
+      "simple": { "limit": 600, "period": 60 }
+    }
+  ],
   "vars": {
     // Numeric GitHub user id of the only account allowed to authorize (https://api.github.com/users/<login> -> "id")
     "BOXMCP_OWNER_GITHUB_ID": "0",
@@ -28,8 +40,8 @@
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,
-    "logs": { "enabled": true, "invocation_logs": true, "head_sampling_rate": 1 },
-    // keep /callback?code=...&state=... out of invocation logs
+    "logs": { "enabled": true, "invocation_logs": false, "head_sampling_rate": 1 },
+    // Real wrangler key: strips query strings from request URLs in logs and traces.
     "redact_query_string": true
   }
   // secrets (wrangler secret put):

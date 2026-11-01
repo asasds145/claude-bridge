@@ -1,5 +1,6 @@
 import { env, exports } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
+import { resetSharedDurableState } from "./isolate";
 import type { Env } from "../src/env";
 import { queueStub } from "../src/env";
 import { wrapForClaude } from "../src/util";
@@ -11,6 +12,8 @@ const KEY = "test-chief-key-not-a-secret";
 const fetchW = (path: string, init?: RequestInit) => exports.default.fetch(new Request(BASE + path, init));
 const chief = (path: string, init: RequestInit = {}) =>
   fetchW(path, { ...init, headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json", ...(init.headers ?? {}) } });
+
+beforeEach(() => resetSharedDurableState());
 
 describe("/chief auth", () => {
   it("no key → 401", async () => {
@@ -68,6 +71,10 @@ describe("OAuth / MCP discovery", () => {
     expect(allowedErrorRedirect("https://evil.example/cb", "https://evil.example/cb?error=x")).toBe(false);
     expect(allowedErrorRedirect(undefined, "https://evil.example/cb?error=x")).toBe(false);
     expect(allowedErrorRedirect(CLAUDE_REDIRECT_URI, undefined)).toBe(false);
+    // redirectUri matching is not enough: the destination itself must be the Claude callback.
+    expect(allowedErrorRedirect(CLAUDE_REDIRECT_URI, "https://evil.example/cb?error=x")).toBe(false);
+    expect(allowedErrorRedirect(CLAUDE_REDIRECT_URI, "https://claude.ai.evil.example/api/mcp/auth_callback")).toBe(false);
+    expect(allowedErrorRedirect(CLAUDE_REDIRECT_URI, "https://user:pw@claude.ai/api/mcp/auth_callback?error=x")).toBe(false);
   });
   it("PKCE S256 required", () => {
     expect(pkceOk({ codeChallenge: "abc", codeChallengeMethod: "S256" })).toBe(true);
