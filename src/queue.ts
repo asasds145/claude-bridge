@@ -32,9 +32,8 @@ export const GRANT_TOUCH_MS = 60_000;
 const HOUR = 3600 * 1000;
 
 export type ForgeReservation =
-  | { action: "known"; retryAfter: 0 }
-  | { action: "reserved"; refundable: boolean; retryAfter: number; resetAt: number }
-  | { action: "deny"; retryAfter: number };
+  | { action: "reserved"; bucket: "forge" | "known"; refundable: boolean; retryAfter: number; resetAt: number }
+  | { action: "deny"; bucket: "forge" | "known"; retryAfter: number };
 
 export type WebhookBlockReason = "non_https" | "invalid_url" | "missing_key";
 
@@ -142,29 +141,14 @@ export class BoxmcpQueue extends DurableObject<Env> {
 
   /**
    * Serialized by the Durable Object input gate, so a parallel burst cannot reserve more than `limit` lookups.
-   * A grant the owner check already accepted skips the budget entirely.
+   * A stored grant id is not the secret: those lookups use mcp:known, not an unlimited skip, and not mcp:forge
+   * (unknown forgeries must not be able to fill the bucket a recorded login uses). seen_at is not touched here.
    */
-  async reserveForge(grantId: string, limit: number, windowMs: number): Promise<ForgeReservation> {
-    // Known grants skip the budget. Do not touch seen_at here: a wrong secret must not refresh recency.
+  async reserveForge(grantId: string, limit: number, windowMs: number, knownLimit = limit): Promise<ForgeReservation> {
     if (ACCEPTED_GRANT_RE.test(grantId) && this.ownerGrantKnown(grantId)) {
-      return { action: "known", retryAfter: 0 };
+      return this.reserveNamed("mcp:known", knownLimit, windowMs, false);
     }
-    const now = Date.now();
-    let b = this.buckets.get("mcp:forge");
-    if (!b || b.resetAt <= now) {
-      b = { count: 0, resetAt: now + windowMs };
-      this.buckets.set("mcp:forge", b);
-    }
-    const retryAfter = Math.max(1, Math.ceil((b.resetAt - now) / 1000));
-    if (b.count < limit) {
-      b.count++;
-      return { action: "reserved", refundable: true, retryAfter, resetAt: b.resetAt };
-    }
-    if (now - this.forgeTrickleAt >= FORGE_TRICKLE_MS) {
-      this.forgeTrickleAt = now;
-      return { action: "reserved", refundable: false, retryAfter, resetAt: b.resetAt };
-    }
-    return { action: "deny", retryAfter };
+    return this.reserveNamed("mcp:forge", limit, windowMs, true);
   }
 
   /**
@@ -172,7 +156,42 @@ export class BoxmcpQueue extends DurableObject<Env> {
    * A refund from an earlier window must not credit the window that replaced it.
    */
   async releaseForge(resetAt: number): Promise<void> {
-    const b = this.buckets.get("mcp:forge");
+    this.releaseBucket("mcp:forge", resetAt);
+  }
+
+  /** Same window rule as releaseForge, for the stored-grant lookup budget. */
+  async releaseKnown(resetAt: number): Promise<void> {
+    this.releaseBucket("mcp:known", resetAt);
+  }
+
+  private reserveNamed(
+    bucket: "mcp:forge" | "mcp:known",
+    limit: number,
+    windowMs: number,
+    allowTrickle: boolean,
+  ): ForgeReservation {
+    const now = Date.now();
+    let b = this.buckets.get(bucket);
+    if (!b || b.resetAt <= now) {
+      b = { count: 0, resetAt: now + windowMs };
+      this.buckets.set(bucket, b);
+    }
+    const retryAfter = Math.max(1, Math.ceil((b.resetAt - now) / 1000));
+    const kind = bucket === "mcp:known" ? "known" : "forge";
+    if (b.count < limit) {
+      b.count++;
+      return { action: "reserved", bucket: kind, refundable: true, retryAfter, resetAt: b.resetAt };
+    }
+    // Trickle is only for unknown owner-shaped tokens. It does not add a slot that can be refunded.
+    if (allowTrickle && now - this.forgeTrickleAt >= FORGE_TRICKLE_MS) {
+      this.forgeTrickleAt = now;
+      return { action: "reserved", bucket: kind, refundable: false, retryAfter, resetAt: b.resetAt };
+    }
+    return { action: "deny", bucket: kind, retryAfter };
+  }
+
+  private releaseBucket(bucket: string, resetAt: number): void {
+    const b = this.buckets.get(bucket);
     if (!b || b.resetAt !== resetAt || b.count <= 0) return;
     b.count--;
   }
@@ -191,9 +210,20 @@ export class BoxmcpQueue extends DurableObject<Env> {
       grantId,
       now,
     );
+    // Always keep the row just written. An UPDATE does not change rowid, so a tie on seen_at
+    // ordered only by rowid could otherwise evict it. Among the rest, higher rowid wins a tie.
     this.sql.exec(
-      `DELETE FROM accepted_grants WHERE grant_id NOT IN (SELECT grant_id FROM accepted_grants ORDER BY seen_at DESC LIMIT ?)`,
-      MAX_ACCEPTED_GRANTS,
+      `DELETE FROM accepted_grants
+       WHERE grant_id <> ?
+         AND grant_id NOT IN (
+           SELECT grant_id FROM accepted_grants
+           WHERE grant_id <> ?
+           ORDER BY seen_at DESC, rowid DESC
+           LIMIT ?
+         )`,
+      grantId,
+      grantId,
+      MAX_ACCEPTED_GRANTS - 1,
     );
   }
 

@@ -13,6 +13,14 @@ export default defineConfig({
           BOXMCP_OWNER_GITHUB_ID: "12345",
           GITHUB_CLIENT_ID: "test-client-id",
         },
+        // Same binding as wrangler, with a small limit so a short loop can reach 429.
+        // Bursts that must still reach the Durable Object use a distinct address per request.
+        ratelimits: {
+          MCP_IP_LIMITER: {
+            namespace_id: "1001",
+            simple: { limit: 8, period: 60 },
+          },
+        },
       },
     }),
   ],

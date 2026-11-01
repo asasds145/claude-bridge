@@ -14,6 +14,17 @@
     // `npx wrangler kv namespace create OAUTH_KV` and paste the id here
     { "binding": "OAUTH_KV", "id": "<YOUR_KV_NAMESPACE_ID>" }
   ],
+  // IP ceiling in front of /mcp. namespace_id is chosen by this app, not a Cloudflare account id.
+  // 600/min is 30x the owner's 20/min cap: normal use does not hit it, and one address still cannot
+  // open thousands of KV lookups per minute before the Durable Object. Takes effect on the next deploy.
+  // https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
+  "ratelimits": [
+    {
+      "name": "MCP_IP_LIMITER",
+      "namespace_id": "1001",
+      "simple": { "limit": 600, "period": 60 }
+    }
+  ],
   "vars": {
     // Numeric GitHub user id of the only account allowed to authorize (https://api.github.com/users/<login> -> "id")
     "BOXMCP_OWNER_GITHUB_ID": "0",

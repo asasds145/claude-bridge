@@ -5,7 +5,7 @@ import { handleChief } from "./chief";
 import { type Env, queueStub } from "./env";
 import { createServer } from "./mcp";
 import { REGISTER_SHARD_HEX } from "./queue";
-import { MAX_BODY_BYTES, clientIp, json, logLine, routeLabel, sha256Hex } from "./util";
+import { MAX_BODY_BYTES, clientIp, errorClass, json, logLine, routeLabel, sha256Hex } from "./util";
 
 export { BoxmcpQueue } from "./queue";
 
@@ -20,6 +20,11 @@ export const MCP_PREAUTH_PER_MIN = 120;
  * and released if the provider accepts the token. Stored grants skip this budget.
  */
 export const MCP_FORGE_PER_MIN = 60;
+/**
+ * Lookups for a grant id that is already stored. The id is not the secret, so these still take a slot
+ * before KV. Separate from mcp:forge so a flood of unknown forgeries cannot crowd out a recorded login.
+ */
+export const MCP_KNOWN_PER_MIN = 120;
 export const REGISTER_RATE_PER_HOUR = 5;
 export const ACCESS_TOKEN_TTL = 3600;
 /** 30 days. Matches workers-oauth-provider's default, set explicitly so a grant cannot live forever. Refresh does not extend it. */
@@ -85,7 +90,13 @@ function getProvider(origin: string): OAuthProvider<Env> {
       if (options.grantType !== "authorization_code" && options.grantType !== "refresh_token") return;
       const owner = expectedOwnerUser(options.env);
       if (!owner || options.userId !== owner) return;
-      await queueStub(options.env).rememberOwnerGrant(options.grantId);
+      // Recording is an optimization. A Durable Object failure must not turn /oauth/token into a 500:
+      // /mcp records the grant after the owner check, and the forge trickle covers the gap until then.
+      try {
+        await queueStub(options.env).rememberOwnerGrant(options.grantId);
+      } catch (e) {
+        logLine("grant_record", { error_class: errorClass(e) });
+      }
     },
     scopesSupported: ["mcp", "offline_access"],
     requiredScopes: ["mcp"],
@@ -126,8 +137,11 @@ export default {
 
     // workers-oauth-provider 1.2.4 matchApiRoute: exact "/mcp" or a descendant "/mcp/...". "/mcpx" is not an API route.
     const mcpPath = path === "/mcp" || path.startsWith("/mcp/");
-    let forgeReleaseAt: number | null = null;
+    let refund: { bucket: "forge" | "known"; resetAt: number } | null = null;
     if (mcpPath) {
+      // Before any Durable Object call. A flood should die here, not on the single queue object.
+      const ipBlock = await rejectIfMcpIpLimited(req, env, o.origin);
+      if (ipBlock) return ipBlock;
       const cls = classifyMcpAuth(req, env);
       if (cls.kind === "unauth") {
         const rl = await queueStub(env).rateLimit("mcp:unauth", MCP_PREAUTH_PER_MIN, 60_000);
@@ -136,20 +150,24 @@ export default {
           return mcpLimited(o.origin, rl.retryAfter);
         }
       } else if (cls.kind === "forge") {
-        // One DO call reserves the slot before KV. A stored owner grant skips the budget.
-        const slot = await queueStub(env).reserveForge(cls.grantId, MCP_FORGE_PER_MIN, 60_000);
+        // One DO call reserves the slot before KV. A stored grant uses mcp:known, not an unlimited skip.
+        const slot = await queueStub(env).reserveForge(cls.grantId, MCP_FORGE_PER_MIN, 60_000, MCP_KNOWN_PER_MIN);
         if (slot.action === "deny") {
           logLine("req", { route: routeLabel(path), status: 429 });
           return mcpLimited(o.origin, slot.retryAfter);
         }
-        if (slot.action === "reserved" && slot.refundable) forgeReleaseAt = slot.resetAt;
+        if (slot.action === "reserved" && slot.refundable) refund = { bucket: slot.bucket, resetAt: slot.resetAt };
       }
     }
 
     const raw = await getProvider(o.origin).fetch(req, env, ctx);
     const { res, mark } = stripAuthMark(raw);
-    // Provider accepted the token (current owner or a previous owner). Release only this window's slot.
-    if (forgeReleaseAt !== null && (mark === "owner" || mark === "mismatch")) await queueStub(env).releaseForge(forgeReleaseAt);
+    // Only a fully owner-validated token returns its slot, and only in the window that reservation used.
+    if (refund && mark === "owner") {
+      const stub = queueStub(env);
+      if (refund.bucket === "known") await stub.releaseKnown(refund.resetAt);
+      else await stub.releaseForge(refund.resetAt);
+    }
     logLine("req", { route: routeLabel(path), status: res.status });
     return res;
   },
@@ -189,7 +207,7 @@ function stripAuthMark(res: Response): { res: Response; mark: string | null } {
   return { res: new Response(res.body, { status: res.status, statusText: res.statusText, headers }), mark };
 }
 
-/** Provider 1.2.4 handleApiRequest: `^Bearer[\\t ]+([^\\s,]+)$`. Anything else is not a token lookup. */
+/** Provider 1.2.4 parseBearerToken: `/^Bearer[\t ]+([^\s,]+)$/i`. The `i` flag accepts a lowercase scheme. Anything else is not a token lookup. */
 function providerBearer(header: string | null): string | null {
   if (!header) return null;
   return /^Bearer[\t ]+([^\s,]+)$/i.exec(header)?.[1] ?? null;
@@ -207,6 +225,37 @@ function ownerGrantId(token: string, env: Env): string | null {
   const parts = token.split(":");
   if (parts.length !== 3 || parts[0] !== owner || parts[1].length === 0 || parts[2].length === 0) return null;
   return parts[1];
+}
+
+/** Binding period. limit() does not report time left in the window, so Retry-After is this whole period. */
+const MCP_IP_RETRY_AFTER = 60;
+/** Used when CF-Connecting-IP is missing. Not a hash, so it cannot collide with a hashed address. */
+const MCP_IP_ABSENT_KEY = "no-connecting-ip";
+
+/**
+ * Shed Authorization-bearing /mcp traffic before the Durable Object.
+ * No Authorization header: not counted. Those are a cheap 401, including connector probes.
+ * Missing binding or a thrown limit() fails open and logs a fixed label. Fail closed would lock the owner out of a misconfig.
+ */
+async function rejectIfMcpIpLimited(req: Request, env: Env, origin: string): Promise<Response | null> {
+  if (req.headers.get("authorization") === null) return null;
+  const limiter = env.MCP_IP_LIMITER;
+  if (!limiter) {
+    logLine("req", { route: "/mcp", rate_limiter: "missing" });
+    return null;
+  }
+  const ip = req.headers.get("cf-connecting-ip");
+  // The rate-limit key can be retained by the binding. Store a hash, not the address.
+  const key = ip ? await sha256Hex(ip) : MCP_IP_ABSENT_KEY;
+  try {
+    const outcome = await limiter.limit({ key });
+    if (outcome.success) return null;
+  } catch (e) {
+    logLine("req", { route: "/mcp", rate_limiter: "error", error_class: errorClass(e) });
+    return null;
+  }
+  logLine("req", { route: "/mcp", status: 429, rate_limiter: "limited" });
+  return mcpLimited(origin, MCP_IP_RETRY_AFTER);
 }
 
 type McpAuthClass = { kind: "none" } | { kind: "unauth" } | { kind: "forge"; grantId: string };

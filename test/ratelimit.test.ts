@@ -3,7 +3,7 @@ import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 import { queueStub } from "../src/env";
 import { MCP_FORGE_PER_MIN, MCP_PREAUTH_PER_MIN } from "../src/index";
-import { MAX_PUBLIC_BUCKETS, type BoxmcpQueue } from "../src/queue";
+import { GRANT_TOUCH_MS, MAX_PUBLIC_BUCKETS, type BoxmcpQueue } from "../src/queue";
 import { resetSharedDurableState } from "./isolate";
 
 const KEY = "test-chief-key-not-a-secret";
@@ -48,7 +48,11 @@ describe("rate limit", () => {
       const r = await exports.default.fetch(
         new Request("https://chief-bridge.test/mcp", {
           method: "POST",
-          headers: { authorization: `Bearer not-a-token-${i}`, "content-type": "application/json" },
+          headers: {
+            authorization: `Bearer not-a-token-${i}`,
+            "content-type": "application/json",
+            "cf-connecting-ip": `203.0.114.${i + 1}`,
+          },
           body: "{}",
         }),
       );
@@ -79,6 +83,7 @@ describe("rate limit", () => {
             headers: {
               authorization: `Bearer github-12345:${grant}:${"s".repeat(32)}`,
               "content-type": "application/json",
+              "cf-connecting-ip": `198.51.100.${i + 1}`,
             },
             body: "{}",
           }),
@@ -104,17 +109,22 @@ describe("rate limit", () => {
       view.forgeTrickleAt = Date.now() + 3_600_000;
     });
     const base = "https://chief-bridge.test";
-    const post = (path: string, authorization?: string) =>
-      exports.default.fetch(
+    let postN = 0;
+    const post = (path: string, authorization?: string) => {
+      postN += 1;
+      return exports.default.fetch(
         new Request(base + path, {
           method: "POST",
           headers: {
             "content-type": "application/json",
+            // Distinct address so these few calls do not share the test IP budget with each other.
+            "cf-connecting-ip": `203.0.115.${postN}`,
             ...(authorization ? { authorization } : {}),
           },
           body: "{}",
         }),
       );
+    };
     // Provider bearer parse is case-insensitive. A lowercase scheme is still owner-shaped, so a full unauth bucket must not 429 it.
     const lower = await post("/mcp", `bearer github-12345:${"c".repeat(16)}:${"d".repeat(32)}`);
     expect(lower.status).toBe(401);
@@ -148,6 +158,37 @@ describe("rate limit", () => {
     expect(result.count).toBe(4);
   });
 
+  it("refunds a slot in the same window, and a trickle admission is not a refundable slot", async () => {
+    const stub = queueStub(env as never);
+    const result = await runInDurableObject(stub, async (inst: BoxmcpQueue) => {
+      const view = inst as unknown as { forgeTrickleAt: number };
+      const first = await inst.reserveForge("a".repeat(16), 2, 60_000);
+      if (first.action !== "reserved" || !first.refundable) return { ok: false as const };
+      await inst.releaseForge(first.resetAt);
+      const afterRefund = trustedOf(inst).get("mcp:forge")?.count ?? -1;
+      await inst.reserveForge("b".repeat(16), 2, 60_000);
+      await inst.reserveForge("c".repeat(16), 2, 60_000);
+      const atCap = trustedOf(inst).get("mcp:forge")?.count ?? -1;
+      view.forgeTrickleAt = 0;
+      const trickle = await inst.reserveForge("d".repeat(16), 2, 60_000);
+      return {
+        ok: true as const,
+        afterRefund,
+        atCap,
+        trickleAction: trickle.action,
+        trickleRefundable: trickle.action === "reserved" ? trickle.refundable : null,
+        afterTrickle: trustedOf(inst).get("mcp:forge")?.count ?? -1,
+      };
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.afterRefund).toBe(0);
+    expect(result.atCap).toBe(2);
+    expect(result.trickleAction).toBe("reserved");
+    expect(result.trickleRefundable).toBe(false);
+    expect(result.afterTrickle).toBe(2);
+  });
+
   it("the 33rd accepted grant evicts the oldest", async () => {
     const stub = queueStub(env as never);
     const oldest = ("o" + "1".padStart(15, "0")).slice(0, 16);
@@ -170,6 +211,65 @@ describe("rate limit", () => {
     expect(result.count).toBe(32);
     expect(result.hasOldest).toBe(false);
     expect(result.hasNewest).toBe(true);
+  });
+
+  it("keeps the row just written when every seen_at ties, including an updated low rowid", async () => {
+    const stub = queueStub(env as never);
+    const keep = ("k" + "0".repeat(15)).slice(0, 16);
+    const oldestOther = ("n" + "0".padStart(15, "0")).slice(0, 16);
+    const frozen = 1_700_000_000_000;
+    const realNow = Date.now;
+    const result = await runInDurableObject(stub, async (inst: BoxmcpQueue, state) => {
+      // Freeze the clock so the rewrite lands on the same seen_at as the other rows. No wall clock.
+      Date.now = () => frozen;
+      try {
+        state.storage.sql.exec(`INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?)`, keep, frozen - GRANT_TOUCH_MS);
+        for (let i = 0; i < 32; i++) {
+          const id = ("n" + String(i).padStart(15, "0")).slice(0, 16);
+          state.storage.sql.exec(`INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?)`, id, frozen);
+        }
+        await inst.rememberOwnerGrant(keep);
+        const rows = state.storage.sql.exec<{ grant_id: string }>(`SELECT grant_id FROM accepted_grants`).toArray();
+        return {
+          count: rows.length,
+          hasKeep: rows.some((r) => r.grant_id === keep),
+          hasOldestOther: rows.some((r) => r.grant_id === oldestOther),
+        };
+      } finally {
+        Date.now = realNow;
+      }
+    });
+    expect(result.count).toBe(32);
+    expect(result.hasKeep).toBe(true);
+    expect(result.hasOldestOther).toBe(false);
+  });
+
+  it("skips the grant write inside 60s and writes again at the boundary", async () => {
+    const stub = queueStub(env as never);
+    const id = ("b" + "1".repeat(15)).slice(0, 16);
+    const frozen = 1_700_000_000_000;
+    const realNow = Date.now;
+    const result = await runInDurableObject(stub, async (inst: BoxmcpQueue, state) => {
+      Date.now = () => frozen;
+      try {
+        const seenOf = () =>
+          state.storage.sql.exec<{ seen_at: number }>(`SELECT seen_at FROM accepted_grants WHERE grant_id = ?`, id).one().seen_at;
+        state.storage.sql.exec(
+          `INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?)`,
+          id,
+          frozen - (GRANT_TOUCH_MS - 1),
+        );
+        await inst.rememberOwnerGrant(id);
+        const skipped = seenOf();
+        state.storage.sql.exec(`UPDATE accepted_grants SET seen_at = ? WHERE grant_id = ?`, frozen - GRANT_TOUCH_MS, id);
+        await inst.rememberOwnerGrant(id);
+        return { skipped, written: seenOf() };
+      } finally {
+        Date.now = realNow;
+      }
+    });
+    expect(result.skipped).toBe(frozen - (GRANT_TOUCH_MS - 1));
+    expect(result.written).toBe(frozen);
   });
 
   it("a full public map does not refuse trusted keys, and expired public keys are reclaimed", async () => {

@@ -12,12 +12,21 @@ export async function resetSharedDurableState(): Promise<void> {
       forgeTrickleAt: number;
     };
     for (const key of [...view.buckets.keys()]) {
-      if (key === "chief" || key === "send_to_chief" || key === "mcp:unauth" || key === "mcp:forge" || key.startsWith("mcp:github-")) {
+      if (
+        key === "chief" ||
+        key === "send_to_chief" ||
+        key === "mcp:unauth" ||
+        key === "mcp:forge" ||
+        key === "mcp:known" ||
+        key.startsWith("mcp:github-")
+      ) {
         view.buckets.delete(key);
       }
     }
     view.publicBuckets.clear();
     view.forgeTrickleAt = Date.now();
+    // Webhook tests replace inst.env. Put the worker env back so a later test does not keep that override.
+    (inst as unknown as { env: unknown }).env = env;
     state.storage.sql.exec(`DELETE FROM accepted_grants`);
   });
 }

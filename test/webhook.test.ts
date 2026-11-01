@@ -46,7 +46,12 @@ beforeEach(async () => {
     state.storage.sql.exec(`DELETE FROM meta WHERE k IN ('wh_due','wh_attempt','wh_sends','wh_chain_wm')`);
   });
 });
-afterEach(() => vi.restoreAllMocks());
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await runInDurableObject(queueStub(E), (inst: BoxmcpQueue) => {
+    (inst as unknown as { env: Env }).env = E;
+  });
+});
 
 function setWebhookEnv(url: string | undefined, key: string | undefined, scheme?: string) {
   return runInDurableObject(queueStub(E), (inst: BoxmcpQueue) => {
