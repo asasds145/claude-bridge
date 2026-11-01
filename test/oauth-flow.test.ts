@@ -1,4 +1,4 @@
-import { createExecutionContext, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
+import { createExecutionContext, evictDurableObject, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CLAUDE_REDIRECT_URI } from "../src/auth-github";
@@ -391,6 +391,51 @@ describe("authenticated /mcp", () => {
     expect(statuses[MCP_RATE_PER_MIN]).toBe(429);
     expect(lastLimited?.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
     expect(Number(lastLimited?.headers.get("retry-after"))).toBeGreaterThan(0);
+  }, 30_000);
+
+  it("records a new grant at token issuance while the forge trickle is held, and a restart keeps it", async () => {
+    const stub = queueStub(env as never);
+    const fillForge = (inst: BoxmcpQueue) => {
+      const view = inst as unknown as { buckets: Map<string, { count: number; resetAt: number }>; forgeTrickleAt: number };
+      view.buckets.set("mcp:forge", { count: MCP_FORGE_PER_MIN, resetAt: Date.now() + 60_000 });
+      view.forgeTrickleAt = Date.now() + 3_600_000;
+    };
+    await runInDurableObject(stub, fillForge);
+    const done = await flow(12345);
+    const code = new URL(done.headers.get("location")!).searchParams.get("code");
+    expect(code).toBeTruthy();
+    const issued = await exchange(code as string);
+    const grantId = issued.access_token.split(":")[1];
+    const stored = await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      return state.storage.sql.exec(`SELECT 1 AS n FROM accepted_grants WHERE grant_id = ?`, grantId).toArray().length;
+    });
+    expect(stored).toBe(1);
+    const first = await call(mcpInit(issued.access_token));
+    expectInitialized(first.status, await first.text());
+
+    await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      state.storage.sql.exec(`UPDATE accepted_grants SET seen_at = 1000 WHERE grant_id = ?`, grantId);
+    });
+    const wrong = await call(new Request(`${BASE}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer github-12345:${grantId}:${"z".repeat(32)}`,
+        host: "chief-bridge.test",
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: "{}",
+    }));
+    expect(wrong.status).toBe(401);
+    const seenAfter = await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      return state.storage.sql.exec<{ seen_at: number }>(`SELECT seen_at FROM accepted_grants WHERE grant_id = ?`, grantId).one().seen_at;
+    });
+    expect(seenAfter).toBe(1000);
+
+    await evictDurableObject(stub);
+    await runInDurableObject(stub, fillForge);
+    const afterEvict = await call(mcpInit(issued.access_token));
+    expectInitialized(afterEvict.status, await afterEvict.text());
   }, 30_000);
 });
 

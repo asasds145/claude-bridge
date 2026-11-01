@@ -64,6 +64,11 @@ describe("rate limit", () => {
   });
 
   it("parallel forged owner-shaped tokens cannot exceed the forge cap", async () => {
+    const stub = queueStub(env as never);
+    // Hold the trickle closed for the whole burst so the cap does not depend on how long the test runs.
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      (inst as unknown as { forgeTrickleAt: number }).forgeTrickleAt = Date.now() + 3_600_000;
+    });
     const extra = 25;
     const responses = await Promise.all(
       Array.from({ length: MCP_FORGE_PER_MIN + extra }, (_, i) => {
@@ -92,12 +97,11 @@ describe("rate limit", () => {
 
   it("charges malformed Authorization and /mcp descendants, not a non-API path", async () => {
     const stub = queueStub(env as never);
+    const bucketsOf = (inst: BoxmcpQueue) => (inst as unknown as { buckets: Map<string, { count: number; resetAt: number }>; forgeTrickleAt: number });
     await runInDurableObject(stub, (inst: BoxmcpQueue) => {
-      const buckets = (inst as unknown as { buckets: Map<string, { count: number; resetAt: number }> }).buckets;
-      const full = { count: MCP_PREAUTH_PER_MIN, resetAt: Date.now() + 60_000 };
-      buckets.set("mcp:unauth", full);
-      buckets.set("mcp:forge", { count: MCP_FORGE_PER_MIN, resetAt: Date.now() + 60_000 });
-      (inst as unknown as { forgeTrickleAt: number }).forgeTrickleAt = Date.now();
+      const view = bucketsOf(inst);
+      view.buckets.set("mcp:unauth", { count: MCP_PREAUTH_PER_MIN, resetAt: Date.now() + 60_000 });
+      view.forgeTrickleAt = Date.now() + 3_600_000;
     });
     const base = "https://chief-bridge.test";
     const post = (path: string, authorization?: string) =>
@@ -111,6 +115,9 @@ describe("rate limit", () => {
           body: "{}",
         }),
       );
+    // Provider bearer parse is case-insensitive. A lowercase scheme is still owner-shaped, so a full unauth bucket must not 429 it.
+    const lower = await post("/mcp", `bearer github-12345:${"c".repeat(16)}:${"d".repeat(32)}`);
+    expect(lower.status).toBe(401);
     const spaced = await post("/mcp", "Bearer a:b:c d");
     expect(spaced.status).toBe(429);
     expect(spaced.headers.get("www-authenticate") ?? "").toContain(`resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`);
@@ -120,9 +127,49 @@ describe("rate limit", () => {
     const bare = await post("/mcp");
     expect(bare.status).toBe(401);
     expect(bare.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
-    // matchApiRoute does not treat /mcpx as /mcp, so this is not a token lookup.
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      bucketsOf(inst).buckets.set("mcp:forge", { count: MCP_FORGE_PER_MIN, resetAt: Date.now() + 60_000 });
+    });
     const notApi = await post("/mcpx", `Bearer github-12345:${"a".repeat(16)}:${"b".repeat(32)}`);
-    expect(notApi.status).not.toBe(429);
+    expect(notApi.status).toBe(404);
+  });
+
+  it("a refund from an old forge window does not credit the current window", async () => {
+    const stub = queueStub(env as never);
+    const result = await runInDurableObject(stub, async (inst: BoxmcpQueue) => {
+      const first = await inst.reserveForge("a".repeat(16), 60, 60_000);
+      if (first.action !== "reserved" || !first.refundable) return { ok: false, count: -1 };
+      const oldReset = first.resetAt;
+      trustedOf(inst).set("mcp:forge", { count: 4, resetAt: oldReset + 60_000 });
+      await inst.releaseForge(oldReset);
+      return { ok: true, count: trustedOf(inst).get("mcp:forge")?.count ?? -1 };
+    });
+    expect(result.ok).toBe(true);
+    expect(result.count).toBe(4);
+  });
+
+  it("the 33rd accepted grant evicts the oldest", async () => {
+    const stub = queueStub(env as never);
+    const oldest = ("o" + "1".padStart(15, "0")).slice(0, 16);
+    const newest = ("n" + "0".repeat(15)).slice(0, 16);
+    const result = await runInDurableObject(stub, async (inst: BoxmcpQueue, state) => {
+      for (let i = 1; i <= 32; i++) {
+        const id = ("o" + String(i).padStart(15, "0")).slice(0, 16);
+        state.storage.sql.exec(`INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?)`, id, i);
+      }
+      await inst.rememberOwnerGrant(newest);
+      const rows = state.storage.sql
+        .exec<{ grant_id: string; seen_at: number }>(`SELECT grant_id, seen_at FROM accepted_grants`)
+        .toArray();
+      return {
+        count: rows.length,
+        hasOldest: rows.some((r) => r.grant_id === oldest),
+        hasNewest: rows.some((r) => r.grant_id === newest),
+      };
+    });
+    expect(result.count).toBe(32);
+    expect(result.hasOldest).toBe(false);
+    expect(result.hasNewest).toBe(true);
   });
 
   it("a full public map does not refuse trusted keys, and expired public keys are reclaimed", async () => {

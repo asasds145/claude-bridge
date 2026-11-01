@@ -27,11 +27,13 @@ export const ACCEPTED_GRANT_RE = /^[A-Za-z0-9_-]{16}$/;
 export const MAX_ACCEPTED_GRANTS = 32;
 /** When mcp:forge is full, one unknown owner-shaped token may still be looked up this often. */
 export const FORGE_TRICKLE_MS = 5_000;
+/** Skip a SQLite rewrite when this grant was already stored more recently than this. */
+export const GRANT_TOUCH_MS = 60_000;
 const HOUR = 3600 * 1000;
 
 export type ForgeReservation =
   | { action: "known"; retryAfter: 0 }
-  | { action: "reserved"; refundable: boolean; retryAfter: number }
+  | { action: "reserved"; refundable: boolean; retryAfter: number; resetAt: number }
   | { action: "deny"; retryAfter: number };
 
 export type WebhookBlockReason = "non_https" | "invalid_url" | "missing_key";
@@ -143,8 +145,8 @@ export class BoxmcpQueue extends DurableObject<Env> {
    * A grant the owner check already accepted skips the budget entirely.
    */
   async reserveForge(grantId: string, limit: number, windowMs: number): Promise<ForgeReservation> {
+    // Known grants skip the budget. Do not touch seen_at here: a wrong secret must not refresh recency.
     if (ACCEPTED_GRANT_RE.test(grantId) && this.ownerGrantKnown(grantId)) {
-      this.sql.exec(`UPDATE accepted_grants SET seen_at = ? WHERE grant_id = ?`, Date.now(), grantId);
       return { action: "known", retryAfter: 0 };
     }
     const now = Date.now();
@@ -156,25 +158,34 @@ export class BoxmcpQueue extends DurableObject<Env> {
     const retryAfter = Math.max(1, Math.ceil((b.resetAt - now) / 1000));
     if (b.count < limit) {
       b.count++;
-      return { action: "reserved", refundable: true, retryAfter };
+      return { action: "reserved", refundable: true, retryAfter, resetAt: b.resetAt };
     }
     if (now - this.forgeTrickleAt >= FORGE_TRICKLE_MS) {
       this.forgeTrickleAt = now;
-      return { action: "reserved", refundable: false, retryAfter };
+      return { action: "reserved", refundable: false, retryAfter, resetAt: b.resetAt };
     }
     return { action: "deny", retryAfter };
   }
 
-  /** Give back a cap slot when the provider accepted the token (owner or owner-mismatch). Trickle slots are not counted. */
-  async releaseForge(): Promise<void> {
+  /**
+   * Return a cap slot only if that reservation's window is still the current one.
+   * A refund from an earlier window must not credit the window that replaced it.
+   */
+  async releaseForge(resetAt: number): Promise<void> {
     const b = this.buckets.get("mcp:forge");
-    if (b && b.count > 0) b.count--;
+    if (!b || b.resetAt !== resetAt || b.count <= 0) return;
+    b.count--;
   }
 
-  /** Record a grant only after the current-owner check. Bounds the table by dropping the oldest rows. */
+  /**
+   * Record a grant after token issuance for the current owner, or after /mcp owner check.
+   * Skips the write when the row is already newer than GRANT_TOUCH_MS.
+   */
   async rememberOwnerGrant(grantId: string): Promise<void> {
     if (!ACCEPTED_GRANT_RE.test(grantId)) return;
     const now = Date.now();
+    const existing = this.sql.exec<{ seen_at: number }>(`SELECT seen_at FROM accepted_grants WHERE grant_id = ?`, grantId).toArray();
+    if (existing.length && now - Number(existing[0].seen_at) < GRANT_TOUCH_MS) return;
     this.sql.exec(
       `INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?) ON CONFLICT(grant_id) DO UPDATE SET seen_at = excluded.seen_at`,
       grantId,

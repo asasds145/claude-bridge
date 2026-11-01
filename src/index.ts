@@ -16,8 +16,8 @@ export const MCP_RATE_PER_MIN = 20;
  */
 export const MCP_PREAUTH_PER_MIN = 120;
 /**
- * Failed lookups of owner-shaped bearers (forged `github-<owner>:grant:secret`).
- * Charged only after the provider rejects the token. A token it has already accepted is not subject to this budget.
+ * Owner-shaped bearers whose grant is not already stored. A slot is reserved before KV lookup
+ * and released if the provider accepts the token. Stored grants skip this budget.
  */
 export const MCP_FORGE_PER_MIN = 60;
 export const REGISTER_RATE_PER_HOUR = 5;
@@ -80,6 +80,13 @@ function getProvider(origin: string): OAuthProvider<Env> {
     clientRegistrationEndpoint: "/oauth/register",
     accessTokenTTL: ACCESS_TOKEN_TTL,
     refreshTokenTTL: REFRESH_TOKEN_TTL,
+    // Runs on authorization_code and refresh_token issuance, before the client can call /mcp.
+    tokenExchangeCallback: async (options) => {
+      if (options.grantType !== "authorization_code" && options.grantType !== "refresh_token") return;
+      const owner = expectedOwnerUser(options.env);
+      if (!owner || options.userId !== owner) return;
+      await queueStub(options.env).rememberOwnerGrant(options.grantId);
+    },
     scopesSupported: ["mcp", "offline_access"],
     requiredScopes: ["mcp"],
     clientIdMetadataDocumentEnabled: true,
@@ -119,7 +126,7 @@ export default {
 
     // workers-oauth-provider 1.2.4 matchApiRoute: exact "/mcp" or a descendant "/mcp/...". "/mcpx" is not an API route.
     const mcpPath = path === "/mcp" || path.startsWith("/mcp/");
-    let forgeRefundable = false;
+    let forgeReleaseAt: number | null = null;
     if (mcpPath) {
       const cls = classifyMcpAuth(req, env);
       if (cls.kind === "unauth") {
@@ -129,21 +136,20 @@ export default {
           return mcpLimited(o.origin, rl.retryAfter);
         }
       } else if (cls.kind === "forge") {
-        // One DO call reserves the slot before KV. A known owner grant skips the budget.
+        // One DO call reserves the slot before KV. A stored owner grant skips the budget.
         const slot = await queueStub(env).reserveForge(cls.grantId, MCP_FORGE_PER_MIN, 60_000);
         if (slot.action === "deny") {
           logLine("req", { route: routeLabel(path), status: 429 });
           return mcpLimited(o.origin, slot.retryAfter);
         }
-        if (slot.action === "reserved") forgeRefundable = slot.refundable;
+        if (slot.action === "reserved" && slot.refundable) forgeReleaseAt = slot.resetAt;
       }
     }
 
     const raw = await getProvider(o.origin).fetch(req, env, ctx);
     const { res, mark } = stripAuthMark(raw);
-    // Provider accepted the token (current owner or a previous owner). Do not keep the forge charge.
-    // A forged token never reaches apiHandler, so its reservation stays consumed.
-    if (forgeRefundable && (mark === "owner" || mark === "mismatch")) await queueStub(env).releaseForge();
+    // Provider accepted the token (current owner or a previous owner). Release only this window's slot.
+    if (forgeReleaseAt !== null && (mark === "owner" || mark === "mismatch")) await queueStub(env).releaseForge(forgeReleaseAt);
     logLine("req", { route: routeLabel(path), status: res.status });
     return res;
   },
