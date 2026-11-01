@@ -3,7 +3,6 @@ import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CLAUDE_REDIRECT_URI } from "../src/auth-github";
 import { queueStub } from "../src/env";
-import * as envModule from "../src/env";
 import worker, { acceptedOwnerProps, MCP_FORGE_PER_MIN, MCP_PREAUTH_PER_MIN, MCP_RATE_PER_MIN } from "../src/index";
 import { BoxmcpQueue } from "../src/queue";
 import { waitForFreshRateWindow } from "./window";
@@ -207,7 +206,8 @@ let mcpClient = 0;
 function mcpInit(token: string, ip?: string, scheme = "Bearer"): Request {
   mcpClient += 1;
   // The test rate-limit binding is 8/min per address. A unique address keeps this call from spending that budget.
-  const connectingIp = ip ?? `203.0.113.${((mcpClient - 1) % 250) + 1}`;
+  // 1–200. Explicit addresses in this file stay at 210 and above so they do not share a key with this counter.
+  const connectingIp = ip ?? `203.0.113.${((mcpClient - 1) % 200) + 1}`;
   return new Request(`${BASE}/mcp`, {
     method: "POST",
     headers: {
@@ -436,8 +436,10 @@ describe("authenticated /mcp", () => {
     const first = await call(mcpInit(issued.access_token));
     expectInitialized(first.status, await first.text());
 
-    await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
-      state.storage.sql.exec(`UPDATE accepted_grants SET seen_at = 1000 WHERE grant_id = ?`, grantId);
+    const stamped = await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      const seen = Date.now() - 120_000;
+      state.storage.sql.exec(`UPDATE accepted_grants SET seen_at = ? WHERE grant_id = ?`, seen, grantId);
+      return seen;
     });
     const wrong = await call(new Request(`${BASE}/mcp`, {
       method: "POST",
@@ -454,7 +456,7 @@ describe("authenticated /mcp", () => {
     const seenAfter = await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
       return state.storage.sql.exec<{ seen_at: number }>(`SELECT seen_at FROM accepted_grants WHERE grant_id = ?`, grantId).one().seen_at;
     });
-    expect(seenAfter).toBe(1000);
+    expect(seenAfter).toBe(stamped);
 
     await evictDurableObject(stub);
     await runInDurableObject(stub, fillForge);
@@ -658,30 +660,18 @@ describe("grant recording and forge refunds", () => {
     const spy = vi.spyOn(console, "log").mockImplementation((line) => {
       logs.push(String(line));
     });
-    // Reject on the worker side. A throw inside the Durable Object is reported as uncaught
-    // even when this fetch handler catches it.
-    const realQueueStub = queueStub;
-    const stubSpy = vi.spyOn(envModule, "queueStub").mockImplementation((e) => {
-      const stub = realQueueStub(e);
-      return new Proxy(stub, {
-        get(target, prop, receiver) {
-          if (prop === "releaseForge") return () => Promise.reject(new Error("refund-boom"));
-          // Stub methods are already bound by the RPC proxy. Calling bind() on them throws.
-          return Reflect.get(target, prop, receiver);
-        },
-      });
-    });
     try {
       const issued = await issuedToken();
       const grantId = issued.access_token.split(":")[1];
-      const stub = realQueueStub(env as never);
-      await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      const stub = queueStub(env as never);
+      await runInDurableObject(stub, (inst: BoxmcpQueue, state) => {
         state.storage.sql.exec(`DELETE FROM accepted_grants WHERE grant_id = ?`, grantId);
+        inst.faultOnce = "releaseForge";
       });
-      const res = await call(mcpInit(issued.access_token, "192.0.2.77"));
+      const res = await call(mcpInit(issued.access_token, "203.0.113.210"));
       const body = await res.text();
       expectInitialized(res.status, body);
-      expect(body).not.toContain("refund-boom");
+      expect(body).not.toContain("do-fault");
       const recorded = logs
         .map((line) => {
           try {
@@ -693,9 +683,8 @@ describe("grant recording and forge refunds", () => {
         .filter((line) => line?.event === "forge_refund");
       expect(recorded).toHaveLength(1);
       expect(recorded[0]?.error_class).toBe("Error");
-      expect(JSON.stringify(recorded[0])).not.toContain("refund-boom");
+      expect(JSON.stringify(recorded[0])).not.toContain("do-fault");
     } finally {
-      stubSpy.mockRestore();
       spy.mockRestore();
     }
   }, 30_000);
@@ -711,7 +700,7 @@ describe("grant recording and forge refunds", () => {
       return Promise.reject(new Error("grant-boom"));
     };
     try {
-      const res = await call(mcpInit(issued.access_token, "192.0.2.78"));
+      const res = await call(mcpInit(issued.access_token, "203.0.113.211"));
       expectInitialized(res.status, await res.text());
       const recorded = logs
         .map((line) => {
@@ -756,18 +745,18 @@ describe("grant recording and forge refunds", () => {
     expect(afterRefresh?.encryptedProps).toBe(beforeRefresh?.encryptedProps);
 
     acceptedOwnerProps.githubId = undefined;
-    const first = await call(mcpInit(issued.access_token, "192.0.2.60"));
+    const first = await call(mcpInit(issued.access_token, "203.0.113.212"));
     expectInitialized(first.status, await first.text());
     expect(acceptedOwnerProps.githubId).toBe(12345);
     acceptedOwnerProps.githubId = undefined;
-    const second = await call(mcpInit(refreshed.access_token as string, "192.0.2.61"));
+    const second = await call(mcpInit(refreshed.access_token as string, "203.0.113.213"));
     expectInitialized(second.status, await second.text());
     expect(acceptedOwnerProps.githubId).toBe(12345);
   }, 30_000);
 
   it("accepts a valid lowercase bearer", async () => {
     const issued = await issuedToken();
-    const res = await call(mcpInit(issued.access_token, "192.0.2.62", "bearer"));
+    const res = await call(mcpInit(issued.access_token, "203.0.113.214", "bearer"));
     expectInitialized(res.status, await res.text());
   }, 30_000);
 
@@ -775,20 +764,20 @@ describe("grant recording and forge refunds", () => {
     const issued = await issuedToken();
     const statuses: number[] = [];
     for (let i = 0; i < 3; i++) {
-      const res = await call(mcpInit(issued.access_token, "192.0.2.70"));
+      const res = await call(mcpInit(issued.access_token, "203.0.113.215"));
       statuses.push(res.status);
     }
     expect(statuses).toEqual([200, 200, 200]);
   }, 30_000);
 
   it("does not let wrong secrets for a stored grant 429 the owner's own address", async () => {
-    await waitForFreshRateWindow();
     const issued = await issuedToken();
+    await waitForFreshRateWindow();
     const token = issued.access_token;
     const grantId = token.split(":")[1];
     const stub = queueStub(env as never);
-    const ownerIp = "192.0.2.40";
-    const attackerIp = "198.51.100.40";
+    const ownerIp = "203.0.113.216";
+    const attackerIp = "203.0.113.217";
     const seenOf = () =>
       runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
         return state.storage.sql.exec<{ seen_at: number }>(`SELECT seen_at FROM accepted_grants WHERE grant_id = ?`, grantId).one().seen_at;
@@ -799,7 +788,7 @@ describe("grant recording and forge refunds", () => {
         return { forge: map.get("mcp:forge")?.count ?? 0, known: map.has("mcp:known") };
       });
     await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
-      state.storage.sql.exec(`UPDATE accepted_grants SET seen_at = 1000 WHERE grant_id = ?`, grantId);
+      state.storage.sql.exec(`UPDATE accepted_grants SET seen_at = ? WHERE grant_id = ?`, Date.now() - 120_000, grantId);
     });
     const seenBefore = await seenOf();
     for (let i = 0; i < 8; i++) {
@@ -842,7 +831,7 @@ describe("grant recording and forge refunds", () => {
         authorization: `Bearer github-12345:${"u".repeat(16)}:${"s".repeat(32)}`,
         host: "chief-bridge.test",
         "content-type": "application/json",
-        "cf-connecting-ip": "198.51.100.41",
+        "cf-connecting-ip": "203.0.113.218",
       },
       body: "{}",
     }));
@@ -859,13 +848,67 @@ describe("grant recording and forge refunds", () => {
         authorization: `Bearer github-12345:${"v".repeat(16)}:${"s".repeat(32)}`,
         host: "chief-bridge.test",
         "content-type": "application/json",
-        "cf-connecting-ip": "198.51.100.42",
+        "cf-connecting-ip": "203.0.113.219",
       },
       body: "{}",
     }));
     expect(trickled.status).toBe(401);
     const ownerAfterTrickle = await call(mcpInit(token, ownerIp));
     expectInitialized(ownerAfterTrickle.status, await ownerAfterTrickle.text());
+  }, 30_000);
+
+  it("a register flood on the owner's address does not 429 /mcp", async () => {
+    const issued = await issuedToken();
+    await waitForFreshRateWindow();
+    const ip = "203.0.113.230";
+    for (let i = 0; i < 9; i++) {
+      const res = await call(new Request(`${BASE}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json", host: "chief-bridge.test", "cf-connecting-ip": ip },
+        body: JSON.stringify({ redirect_uris: ["https://claude.ai/api/mcp/auth_callback"], token_endpoint_auth_method: "none" }),
+      }));
+      if (i === 8) expect(res.status).toBe(429);
+    }
+    const mcp = await call(mcpInit(issued.access_token, ip));
+    expectInitialized(mcp.status, await mcp.text());
+  }, 30_000);
+
+  it("same-address /mcp junk shares the owner's mcp counter; that overlap is the accepted limit", async () => {
+    const issued = await issuedToken();
+    await waitForFreshRateWindow();
+    const shared = "203.0.113.231";
+    for (let i = 0; i < 8; i++) {
+      const junk = await call(new Request(`${BASE}/mcp`, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer not-a-token",
+          host: "chief-bridge.test",
+          "content-type": "application/json",
+          "cf-connecting-ip": shared,
+        },
+        body: "{}",
+      }));
+      expect(junk.status).toBe(401);
+    }
+    const blocked = await call(mcpInit(issued.access_token, shared));
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
+    const other = await call(mcpInit(issued.access_token, "203.0.113.232"));
+    expectInitialized(other.status, await other.text());
+  }, 30_000);
+
+  it("returns 429 when the ownerAccepted call itself rejects", async () => {
+    const issued = await issuedToken();
+    const stub = queueStub(env as never);
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      inst.faultOnce = "ownerAccepted";
+    });
+    const res = await call(mcpInit(issued.access_token, "203.0.113.233"));
+    const body = await res.text();
+    expect(res.status).toBe(429);
+    expect(body).not.toContain("do-fault");
+    expect(res.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThan(0);
   }, 30_000);
 
   it("refunds a worker forge lookup only in its own window, and a trickle success does not lower the cap", async () => {
@@ -884,7 +927,7 @@ describe("grant recording and forge refunds", () => {
       view.buckets.set("mcp:forge", { count: 3, resetAt: Date.now() + 60_000 });
       view.forgeTrickleAt = Date.now() + 3_600_000;
     });
-    const ok = await call(mcpInit(token, "192.0.2.80"));
+    const ok = await call(mcpInit(token, "203.0.113.220"));
     expectInitialized(ok.status, await ok.text());
     expect((await forgeState()).count).toBe(3);
 
@@ -897,7 +940,7 @@ describe("grant recording and forge refunds", () => {
         authorization: `Bearer github-12345:${"q".repeat(16)}:${"s".repeat(32)}`,
         host: "chief-bridge.test",
         "content-type": "application/json",
-        "cf-connecting-ip": "192.0.2.81",
+        "cf-connecting-ip": "203.0.113.221",
       },
       body: "{}",
     }));
@@ -915,7 +958,7 @@ describe("grant recording and forge refunds", () => {
     await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
       state.storage.sql.exec(`DELETE FROM accepted_grants WHERE grant_id = ?`, grantId);
     });
-    const onNewWindow = await call(mcpInit(token, "192.0.2.82"));
+    const onNewWindow = await call(mcpInit(token, "203.0.113.222"));
     expectInitialized(onNewWindow.status, await onNewWindow.text());
     expect((await forgeState()).count).toBe(9);
 
@@ -925,7 +968,7 @@ describe("grant recording and forge refunds", () => {
       view.buckets.set("mcp:forge", { count: MCP_FORGE_PER_MIN, resetAt: Date.now() + 60_000 });
       view.forgeTrickleAt = 0;
     });
-    const trickled = await call(mcpInit(token, "192.0.2.83"));
+    const trickled = await call(mcpInit(token, "203.0.113.223"));
     expectInitialized(trickled.status, await trickled.text());
     expect((await forgeState()).count).toBe(MCP_FORGE_PER_MIN);
   }, 30_000);

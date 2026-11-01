@@ -22,7 +22,11 @@ export const MCP_PREAUTH_PER_MIN = 120;
 export const MCP_FORGE_PER_MIN = 60;
 export const REGISTER_RATE_PER_HOUR = 5;
 export const ACCESS_TOKEN_TTL = 3600;
-/** 30 days. Matches workers-oauth-provider's default, set explicitly so a grant cannot live forever. Refresh does not extend it. */
+/**
+ * 30 days. workers-oauth-provider 1.2.4 uses the same length as DEFAULT_REFRESH_TOKEN_TTL (720 hours)
+ * when the option is omitted. An explicit undefined means no expiry, so this sets the deadline itself.
+ * Refresh does not extend it, because refreshTokenIdleTTL is unset.
+ */
 export const REFRESH_TOKEN_TTL = GRANT_TTL_MS / 1000;
 
 /** githubId apiHandler just accepted. Tests read this; it is never logged. */
@@ -154,19 +158,30 @@ export default {
       if (ipBlock) return ipBlock;
       const cls = classifyMcpAuth(req, env);
       if (cls.kind === "unauth") {
-        const rl = await queueStub(env).rateLimit("mcp:unauth", MCP_PREAUTH_PER_MIN, 60_000);
-        if (!rl.ok) {
-          logLine("req", { route: routeLabel(path), status: 429 });
-          return mcpLimited(o.origin, rl.retryAfter);
+        try {
+          const rl = await queueStub(env).rateLimit("mcp:unauth", MCP_PREAUTH_PER_MIN, 60_000);
+          if (!rl.ok) {
+            logLine("req", { route: routeLabel(path), status: 429 });
+            return mcpLimited(o.origin, rl.retryAfter);
+          }
+        } catch (e) {
+          // A Durable Object failure here must not surface as a bare 500.
+          logLine("req", { route: "/mcp", status: 429, error_class: errorClass(e) });
+          return mcpLimited(o.origin, 60);
         }
       } else if (cls.kind === "forge") {
         // One DO call reserves the slot before KV. A stored grant skips the budget entirely.
-        const slot = await queueStub(env).reserveForge(cls.grantId, MCP_FORGE_PER_MIN, 60_000);
-        if (slot.action === "deny") {
-          logLine("req", { route: routeLabel(path), status: 429 });
-          return mcpLimited(o.origin, slot.retryAfter);
+        try {
+          const slot = await queueStub(env).reserveForge(cls.grantId, MCP_FORGE_PER_MIN, 60_000);
+          if (slot.action === "deny") {
+            logLine("req", { route: routeLabel(path), status: 429 });
+            return mcpLimited(o.origin, slot.retryAfter);
+          }
+          if (slot.action === "reserved" && slot.refundable) refundResetAt = slot.resetAt;
+        } catch (e) {
+          logLine("req", { route: "/mcp", status: 429, error_class: errorClass(e) });
+          return mcpLimited(o.origin, 60);
         }
-        if (slot.action === "reserved" && slot.refundable) refundResetAt = slot.resetAt;
       }
     }
 
@@ -260,8 +275,10 @@ async function rejectIfIpLimited(req: Request, env: Env, mode: "mcp" | "register
     return null;
   }
   const ip = req.headers.get("cf-connecting-ip");
-  // The rate-limit key can be retained by the binding. Store a hash of the /64 or the IPv4 address, not the raw header.
-  const key = ip ? await sha256Hex(ipRateLimitMaterial(ip)) : MCP_IP_ABSENT_KEY;
+  // One binding, two counters. A registration flood must not spend the /mcp budget for this address.
+  // The key is a hash of the /64 or the IPv4 address, not the raw header.
+  const prefix = mode === "register" ? "reg:" : "mcp:";
+  const key = prefix + (ip ? await sha256Hex(ipRateLimitMaterial(ip)) : MCP_IP_ABSENT_KEY);
   try {
     const outcome = await limiter.limit({ key });
     if (outcome.success) return null;

@@ -15,14 +15,14 @@
     { "binding": "OAUTH_KV", "id": "<YOUR_KV_NAMESPACE_ID>" }
   ],
   // IP ceiling in front of /mcp and POST /oauth/register. Takes effect on the next deploy.
-  // namespace_id is an app-chosen positive integer with no other meaning. It is not an account id.
+  // namespace_id is an app-chosen positive integer below 2^31, with no other meaning. It is not an account id.
   // Bindings that share a namespace_id share counters across every Worker in the account, so this
   // value must be unique among Workers in the account.
   // 600/min is 30x the owner's 20/min cap. https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/
   "ratelimits": [
     {
       "name": "MCP_IP_LIMITER",
-      "namespace_id": "7391846250",
+      "namespace_id": "739184625",
       "simple": { "limit": 600, "period": 60 }
     }
   ],

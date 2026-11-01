@@ -92,17 +92,20 @@ export function ipRateLimitMaterial(ip: string): string {
   const v4 = ipv4Key(text);
   if (v4) return `4:${v4}`;
   const dotted = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(text);
-  let embedded: string | null = null;
   if (dotted) {
-    embedded = ipv4Key(dotted[2]);
+    const embedded = ipv4Key(dotted[2]);
     if (!embedded) return `raw:${text}`;
     const [a, b, c, d] = embedded.split(".").map(Number);
     text = `${dotted[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
   }
   const groups = text.includes(":") ? expandIpv6(text) : null;
   if (!groups) return `raw:${text}`;
-  // ::ffff:0:0/96 carries an IPv4 address in the last 32 bits.
-  if (embedded && groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) return `4:${embedded}`;
+  // ::ffff:0:0/96, whether written as ::ffff:192.0.2.1 or ::ffff:c000:201.
+  if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
+    const hi = groups[6];
+    const lo = groups[7];
+    return `4:${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  }
   return `6:${groups.slice(0, 4).map((g) => g.toString(16)).join(":")}`;
 }
 

@@ -17,7 +17,7 @@ export default defineConfig({
         // Bursts that must still reach the Durable Object use a distinct address per request.
         ratelimits: {
           MCP_IP_LIMITER: {
-            namespace_id: "7391846250",
+            namespace_id: "739184625",
             simple: { limit: 8, period: 60 },
           },
         },

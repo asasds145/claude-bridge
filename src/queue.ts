@@ -88,6 +88,11 @@ export class BoxmcpQueue extends DurableObject<Env> {
   private buckets = new Map<string, { count: number; resetAt: number }>();
   /** Last time an over-cap forge lookup was admitted. In-memory; the accepted-grant table is what survives eviction. */
   private forgeTrickleAt = Date.now();
+  /**
+   * One-shot fault for tests, set only from inside the isolate. No request path writes it.
+   * Cleared when it fires so a later call is not stuck failing.
+   */
+  faultOnce: "releaseForge" | "ownerAccepted" | "reserveForge" | "rateLimit" | null = null;
   /** Keys an unauthenticated caller can multiply (registration shards). Capped separately. */
   private publicBuckets = new Map<string, { count: number; resetAt: number }>();
 
@@ -138,6 +143,7 @@ export class BoxmcpQueue extends DurableObject<Env> {
   // ---------- rate limit (DO 메모리; eviction 시 초기화) ----------
   // Trusted keys are not capped by the public map. Outsider-creatable keys use rateLimitPublic.
   async rateLimit(key: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
+    this.throwIfFault("rateLimit");
     return this.limitIn(this.buckets, key, limit, windowMs, Number.POSITIVE_INFINITY);
   }
 
@@ -150,6 +156,7 @@ export class BoxmcpQueue extends DurableObject<Env> {
    * A grant-write failure is logged and does not fail the RPC, so the caller still rate-limits and answers.
    */
   async ownerAccepted(grantId: string, rateKey: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
+    this.throwIfFault("ownerAccepted");
     if (grantId) {
       try {
         await this.rememberOwnerGrant(grantId);
@@ -167,6 +174,7 @@ export class BoxmcpQueue extends DurableObject<Env> {
    * seen_at is not touched here.
    */
   async reserveForge(grantId: string, limit: number, windowMs: number): Promise<ForgeReservation> {
+    this.throwIfFault("reserveForge");
     if (ACCEPTED_GRANT_RE.test(grantId) && this.ownerGrantKnown(grantId)) {
       return { action: "known", retryAfter: 0 };
     }
@@ -194,6 +202,7 @@ export class BoxmcpQueue extends DurableObject<Env> {
    * A refund from an earlier window must not credit the window that replaced it.
    */
   async releaseForge(resetAt: number): Promise<void> {
+    this.throwIfFault("releaseForge");
     const b = this.buckets.get("mcp:forge");
     if (!b || b.resetAt !== resetAt || b.count <= 0) return;
     b.count--;
@@ -206,6 +215,8 @@ export class BoxmcpQueue extends DurableObject<Env> {
   async rememberOwnerGrant(grantId: string): Promise<void> {
     if (!ACCEPTED_GRANT_RE.test(grantId)) return;
     const now = Date.now();
+    // Drop expired rows even when this grant's own write is skipped, so a read of a fresh row still ages the table out.
+    this.pruneExpiredGrants(now, grantId);
     const existing = this.sql.exec<{ seen_at: number }>(`SELECT seen_at FROM accepted_grants WHERE grant_id = ?`, grantId).toArray();
     if (existing.length && now - Number(existing[0].seen_at) < GRANT_TOUCH_MS) return;
     this.sql.exec(
@@ -213,8 +224,6 @@ export class BoxmcpQueue extends DurableObject<Env> {
       grantId,
       now,
     );
-    // A refresh grant cannot outlive REFRESH_TOKEN_TTL, so a row older than that is not a live login.
-    this.sql.exec(`DELETE FROM accepted_grants WHERE grant_id <> ? AND seen_at < ?`, grantId, now - GRANT_TTL_MS);
     // Always keep the row just written. An UPDATE does not change rowid, so a tie on seen_at
     // ordered only by rowid could otherwise evict it. Among the rest, higher rowid wins a tie.
     this.sql.exec(
@@ -233,7 +242,22 @@ export class BoxmcpQueue extends DurableObject<Env> {
   }
 
   private ownerGrantKnown(grantId: string): boolean {
+    // An expired row must not keep skipping mcp:forge. This read deletes it.
+    this.pruneExpiredGrants(Date.now());
     return this.sql.exec(`SELECT 1 AS n FROM accepted_grants WHERE grant_id = ? LIMIT 1`, grantId).toArray().length > 0;
+  }
+
+  /** Delete grants older than the refresh lifetime. `keepId` is the row this call is about to write. */
+  private pruneExpiredGrants(now: number, keepId?: string): void {
+    const cutoff = now - GRANT_TTL_MS;
+    if (keepId) this.sql.exec(`DELETE FROM accepted_grants WHERE seen_at < ? AND grant_id <> ?`, cutoff, keepId);
+    else this.sql.exec(`DELETE FROM accepted_grants WHERE seen_at < ?`, cutoff);
+  }
+
+  private throwIfFault(op: NonNullable<BoxmcpQueue["faultOnce"]>): void {
+    if (this.faultOnce !== op) return;
+    this.faultOnce = null;
+    throw new Error("do-fault");
   }
 
   private limitIn(

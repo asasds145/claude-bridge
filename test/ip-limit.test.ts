@@ -5,7 +5,8 @@ import type { Env } from "../src/env";
 import { queueStub } from "../src/env";
 import worker from "../src/index";
 import type { BoxmcpQueue } from "../src/queue";
-import { ipRateLimitMaterial } from "../src/util";
+import { ipRateLimitMaterial, sha256Hex } from "../src/util";
+import { REGISTER_SHARD_HEX } from "../src/queue";
 import { resetSharedDurableState } from "./isolate";
 import { waitForFreshRateWindow } from "./window";
 
@@ -44,12 +45,6 @@ function unauthCount() {
   });
 }
 
-function registerBuckets() {
-  return runInDurableObject(queueStub(env as never), (inst: BoxmcpQueue) => {
-    return [...(inst as unknown as { publicBuckets: Map<string, unknown> }).publicBuckets.keys()].filter((k) => k.startsWith("register:")).length;
-  });
-}
-
 describe("IP rate limit binding", () => {
   it("normalizes IPv4 whole and IPv6 at /64", () => {
     expect(ipRateLimitMaterial("203.0.113.10")).toBe("4:203.0.113.10");
@@ -58,6 +53,7 @@ describe("IP rate limit binding", () => {
     expect(ipRateLimitMaterial("2001:0db8:0001:0002:0:0:0:9")).toBe("6:2001:db8:1:2");
     expect(ipRateLimitMaterial("2001:db8:1:3::1")).toBe("6:2001:db8:1:3");
     expect(ipRateLimitMaterial("::ffff:192.0.2.1")).toBe("4:192.0.2.1");
+    expect(ipRateLimitMaterial("::ffff:c000:201")).toBe("4:192.0.2.1");
   });
 
   it("returns 429 before the Durable Object once the address is over the limit", async () => {
@@ -109,15 +105,27 @@ describe("IP rate limit binding", () => {
 
   it("429s POST /oauth/register from a limited address without touching the DO", async () => {
     await waitForFreshRateWindow();
-    const ip = "192.0.2.80";
+    const ip = "192.0.2.70";
     for (let i = 0; i < TEST_IP_LIMIT; i++) {
-      expect((await call(mcp(ip, "Bearer not-a-token"))).status).toBe(401);
+      const res = await call(register(ip));
+      if (i < TEST_IP_LIMIT - 1) expect(res.status).not.toBe(500);
     }
-    expect(await registerBuckets()).toBe(0);
+    const shard = (await sha256Hex(ipRateLimitMaterial(ip))).slice(0, REGISTER_SHARD_HEX);
+    const key = `register:${shard}`;
+    await runInDurableObject(queueStub(env as never), (inst: BoxmcpQueue) => {
+      (inst as unknown as { publicBuckets: Map<string, { count: number; resetAt: number }> }).publicBuckets.set(key, {
+        count: 1,
+        resetAt: Date.now() + 3_600_000,
+      });
+    });
     const blocked = await call(register(ip));
     expect(blocked.status).toBe(429);
     expect(blocked.headers.get("retry-after")).toBe("60");
-    expect(await registerBuckets()).toBe(0);
+    const count = await runInDurableObject(queueStub(env as never), (inst: BoxmcpQueue) => {
+      return (inst as unknown as { publicBuckets: Map<string, { count: number }> }).publicBuckets.get(key)?.count ?? 0;
+    });
+    // A call that reached the object would increment this under-limit shard. The IP limiter returns first.
+    expect(count).toBe(1);
   }, 15_000);
 
   it("fails open when the binding is missing or throws, and does not log the error text", async () => {

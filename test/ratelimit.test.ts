@@ -29,7 +29,7 @@ describe("rate limit", () => {
       const r = await exports.default.fetch(
         new Request("https://chief-bridge.test/oauth/register", {
           method: "POST",
-          headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9" },
+          headers: { "content-type": "application/json", "cf-connecting-ip": "198.51.100.210" },
           body: JSON.stringify({ redirect_uris: ["https://claude.ai/api/mcp/auth_callback"], token_endpoint_auth_method: "none" }),
         }),
       );
@@ -51,7 +51,7 @@ describe("rate limit", () => {
           headers: {
             authorization: `Bearer not-a-token-${i}`,
             "content-type": "application/json",
-            "cf-connecting-ip": `203.0.114.${i + 1}`,
+            "cf-connecting-ip": `198.51.100.${100 + i}`,
           },
           body: "{}",
         }),
@@ -118,7 +118,7 @@ describe("rate limit", () => {
           headers: {
             "content-type": "application/json",
             // Distinct address so these few calls do not share the test IP budget with each other.
-            "cf-connecting-ip": `203.0.115.${postN}`,
+            "cf-connecting-ip": `198.51.100.${150 + postN}`,
             ...(authorization ? { authorization } : {}),
           },
           body: "{}",
@@ -296,6 +296,63 @@ describe("rate limit", () => {
     expect(ids).toContain(fresh);
     expect(ids).toContain(boundary);
     expect(ids).not.toContain(expired);
+  });
+
+  it("an expired grant is dropped when it is read, so it no longer skips forge", async () => {
+    const stub = queueStub(env as never);
+    const id = ("e" + "9".padStart(15, "0")).slice(0, 16);
+    const frozen = 1_800_000_000_000;
+    const realNow = Date.now;
+    const result = await runInDurableObject(stub, async (inst: BoxmcpQueue, state) => {
+      Date.now = () => frozen;
+      try {
+        state.storage.sql.exec(
+          `INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?)`,
+          id,
+          frozen - GRANT_TTL_MS - 1,
+        );
+        const slot = await inst.reserveForge(id, 10, 60_000);
+        const left = state.storage.sql.exec(`SELECT grant_id FROM accepted_grants WHERE grant_id = ?`, id).toArray().length;
+        return { action: slot.action, left };
+      } finally {
+        Date.now = realNow;
+      }
+    });
+    expect(result.action).not.toBe("known");
+    expect(result.left).toBe(0);
+  });
+
+  it("a thrown rateLimit or reserveForge is 429 with WWW-Authenticate, not 500", async () => {
+    const stub = queueStub(env as never);
+    const post = (ip: string, authorization: string) =>
+      exports.default.fetch(new Request("https://chief-bridge.test/mcp", {
+        method: "POST",
+        headers: {
+          authorization,
+          "content-type": "application/json",
+          "cf-connecting-ip": ip,
+        },
+        body: "{}",
+      }));
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      inst.faultOnce = "rateLimit";
+    });
+    const unauth = await post("198.51.100.220", "Bearer not-a-token");
+    const unauthBody = await unauth.text();
+    expect(unauth.status).toBe(429);
+    expect(unauthBody).not.toContain("do-fault");
+    expect(unauth.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
+    expect(unauth.headers.get("retry-after")).toBe("60");
+
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      inst.faultOnce = "reserveForge";
+    });
+    const forged = await post("198.51.100.221", `Bearer github-12345:${"q".repeat(16)}:${"s".repeat(32)}`);
+    const forgedBody = await forged.text();
+    expect(forged.status).toBe(429);
+    expect(forgedBody).not.toContain("do-fault");
+    expect(forged.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
+    expect(forged.headers.get("retry-after")).toBe("60");
   });
 
   it("a full public map does not refuse trusted keys, and expired public keys are reclaimed", async () => {
