@@ -146,6 +146,23 @@ describe("webhook destination guards", () => {
     expect(alarm).toBe(Number(await meta("cleanup_due")));
   });
 
+  it("clears a schedule when the webhook URL is removed", async () => {
+    mockFetch(() => new Response("ok", { status: 200 }));
+    const stub = queueStub(E);
+    await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_due', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`, String(Date.now() + 60_000));
+      state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_attempt', '2') ON CONFLICT(k) DO UPDATE SET v = excluded.v`);
+      state.storage.sql.exec(`INSERT INTO meta (k, v) VALUES ('wh_chain_wm', '4') ON CONFLICT(k) DO UPDATE SET v = excluded.v`);
+    });
+    await setWebhookEnv(undefined, undefined);
+    await stub.sendToChief("url-removed");
+    expect(await meta("wh_due")).toBeNull();
+    expect(await meta("wh_attempt")).toBeNull();
+    expect(await meta("wh_chain_wm")).toBeNull();
+    expect(await meta("cleanup_due")).not.toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
   it("a due alarm with a missing key or userinfo URL does not fetch", async () => {
     mockFetch(() => new Response("ok", { status: 200 }));
     const stub = queueStub(E);

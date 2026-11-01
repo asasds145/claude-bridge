@@ -66,8 +66,10 @@ export interface WaitResult {
 export class BoxmcpQueue extends DurableObject<Env> {
   private sql: SqlStorage;
   private waiters = new Set<Waiter>();
-  /** Server-chosen keys only: chief, send_to_chief, mcp user, shared unauth bucket. */
+  /** Server-chosen keys only: chief, send_to_chief, mcp user, shared unauth/forge buckets. */
   private buckets = new Map<string, { count: number; resetAt: number }>();
+  /** Fingerprints of access tokens the provider has already accepted. Fixed size, not one per attacker. */
+  private validTokenFps: string[] = [];
   /** Keys an unauthenticated caller can multiply (registration shards). Capped separately. */
   private publicBuckets = new Map<string, { count: number; resetAt: number }>();
 
@@ -121,6 +123,25 @@ export class BoxmcpQueue extends DurableObject<Env> {
 
   async rateLimitPublic(key: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
     return this.limitIn(this.publicBuckets, key, limit, windowMs, MAX_PUBLIC_BUCKETS);
+  }
+
+  /**
+   * Owner-shaped bearers that this isolate has not accepted yet.
+   * `known` skips the failure budget (a real token already worked).
+   * `deny` means forged lookups have filled the budget: do not call the provider.
+   * `allow` means the caller may look the token up, and should charge mcp:forge only if that lookup fails.
+   */
+  async mcpForgeAdmit(fp: string, limit: number): Promise<"known" | "allow" | "deny"> {
+    if (this.validTokenFps.includes(fp)) return "known";
+    const b = this.buckets.get("mcp:forge");
+    if (b && b.resetAt > Date.now() && b.count >= limit) return "deny";
+    return "allow";
+  }
+
+  async noteValidMcpToken(fp: string): Promise<void> {
+    this.validTokenFps = this.validTokenFps.filter((x) => x !== fp);
+    this.validTokenFps.push(fp);
+    if (this.validTokenFps.length > 8) this.validTokenFps.shift();
   }
 
   private limitIn(
@@ -353,19 +374,26 @@ export class BoxmcpQueue extends DurableObject<Env> {
     return t;
   }
 
+  /** Drop wh_due / wh_attempt / wh_chain_wm and keep the cleanup alarm. No-op if nothing is scheduled. */
+  private async dropWebhookSchedule(): Promise<void> {
+    if (this.getMeta("wh_due") === null && this.getMeta("wh_attempt") === null && this.getMeta("wh_chain_wm") === null) return;
+    this.clearWebhook();
+    await this.rearm();
+  }
+
   private async scheduleWebhook(): Promise<void> {
+    // Unset URL is "webhooks off", not a bad URL. Still drop a schedule left over from a previous config.
+    if (!this.env.CHIEF_WEBHOOK_URL) {
+      await this.dropWebhookSchedule();
+      return;
+    }
     const blocked = webhookBlockReason(this.env.CHIEF_WEBHOOK_URL, this.env.CHIEF_WEBHOOK_KEY);
     if (blocked) {
       // Reason code only. The URL and key are operator secrets and must not be logged.
       logLine("webhook_skipped", { reason: blocked });
-      // Drop a schedule that was created under a previously valid config. Keep the cleanup alarm.
-      if (this.getMeta("wh_due") !== null || this.getMeta("wh_attempt") !== null || this.getMeta("wh_chain_wm") !== null) {
-        this.clearWebhook();
-        await this.rearm();
-      }
+      await this.dropWebhookSchedule();
       return;
     }
-    if (!this.env.CHIEF_WEBHOOK_URL) return;
     if (this.getMeta("wh_due") !== null) {
       // 이미 예약됨(또는 발사 중) → 합침. 발사 중에 도착한 메시지는 runWebhook이 id watermark로 감지해 후속 예약.
       return;

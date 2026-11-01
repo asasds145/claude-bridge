@@ -1,6 +1,6 @@
 import { OAuthProvider } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp/server";
-import { handleAuthUi, mcpActorId, mcpUserMatchesOwner } from "./auth-github";
+import { handleAuthUi, mcpActorId, mcpUserMatchesOwner, validOwnerId } from "./auth-github";
 import { handleChief } from "./chief";
 import { type Env, queueStub } from "./env";
 import { createServer } from "./mcp";
@@ -11,13 +11,19 @@ export { BoxmcpQueue } from "./queue";
 
 export const MCP_RATE_PER_MIN = 20;
 /**
- * Shared limit for /mcp requests that are not the configured owner's token shape.
- * One bucket. A valid owner token is not charged to it, so this budget cannot 429 the owner.
- * Arbitrary Authorization values do not get their own buckets.
+ * Shared limit for /mcp bearers that are not the owner's token shape.
+ * Requests with no Authorization header are not charged: the provider rejects them before KV.
  */
 export const MCP_PREAUTH_PER_MIN = 120;
+/**
+ * Failed lookups of owner-shaped bearers (forged `github-<owner>:grant:secret`).
+ * Charged only after the provider rejects the token. A token it has already accepted is not subject to this budget.
+ */
+export const MCP_FORGE_PER_MIN = 60;
 export const REGISTER_RATE_PER_HOUR = 5;
 export const ACCESS_TOKEN_TTL = 3600;
+/** 30 days. Matches workers-oauth-provider's default, set explicitly so a grant cannot live forever. Refresh does not extend it. */
+export const REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60;
 
 const defaultHandler: ExportedHandler<Env> = {
   async fetch(req, env) {
@@ -49,7 +55,15 @@ function getProvider(origin: string): OAuthProvider<Env> {
     // Rate-limit by that validated user id. Do not key buckets by the raw header.
     apiHandler: {
       fetch: async (req, env, ctx) => {
+        // The provider only calls this after it accepts the access token. Remember it so a later
+        // forged flood cannot 429 this same token.
+        const presented = bearerToken(req);
+        if (presented) await queueStub(env).noteValidMcpToken(await tokenFingerprint(presented));
         const userId = mcpActorId(ctx as ExecutionContext & { auth?: { userId?: string }; props?: { githubId?: number } });
+        if (!validOwnerId(env.BOXMCP_OWNER_GITHUB_ID)) {
+          logLine("mcp_auth", { status: 401, code: "bad_owner_id" });
+          return mcpUnauthorized(new URL(req.url).origin);
+        }
         if (!mcpUserMatchesOwner(userId, env.BOXMCP_OWNER_GITHUB_ID)) {
           logLine("mcp_auth", { status: 401, code: "owner_mismatch" });
           return mcpUnauthorized(new URL(req.url).origin);
@@ -64,6 +78,7 @@ function getProvider(origin: string): OAuthProvider<Env> {
     tokenEndpoint: "/oauth/token",
     clientRegistrationEndpoint: "/oauth/register",
     accessTokenTTL: ACCESS_TOKEN_TTL,
+    refreshTokenTTL: REFRESH_TOKEN_TTL,
     scopesSupported: ["mcp", "offline_access"],
     requiredScopes: ["mcp"],
     clientIdMetadataDocumentEnabled: true,
@@ -101,16 +116,30 @@ export default {
       if (!rl.ok) return json({ error: "rate_limited" }, 429, { "retry-after": String(rl.retryAfter) });
     }
 
-    if (path === "/mcp" || path.startsWith("/mcp/")) {
-      // Owner-shaped tokens skip this bucket so junk traffic cannot 429 them.
-      // Every other request, including a random Authorization header, shares mcp:unauth.
-      if (!ownerShapedBearer(req, env)) {
-        const rl = await queueStub(env).rateLimit("mcp:unauth", MCP_PREAUTH_PER_MIN, 60_000);
-        if (!rl.ok) return json({ error: "rate_limited" }, 429, { "retry-after": String(rl.retryAfter) });
+    const mcpPath = path === "/mcp" || path.startsWith("/mcp/");
+    const token = bearerToken(req);
+    const shaped = mcpPath && ownerShapedBearer(req, env);
+    let forgeFp: string | null = null;
+    let forgeAdmit: "known" | "allow" | "deny" | null = null;
+    if (mcpPath && token && !shaped) {
+      // Random Authorization values share one bucket. No header is not charged: that 401 is cheap.
+      const rl = await queueStub(env).rateLimit("mcp:unauth", MCP_PREAUTH_PER_MIN, 60_000);
+      if (!rl.ok) return json({ error: "rate_limited" }, 429, { "retry-after": String(rl.retryAfter) });
+    } else if (shaped && token) {
+      forgeFp = await tokenFingerprint(token);
+      forgeAdmit = await queueStub(env).mcpForgeAdmit(forgeFp, MCP_FORGE_PER_MIN);
+      if (forgeAdmit === "deny") {
+        logLine("req", { route: routeLabel(path), status: 429 });
+        return json({ error: "rate_limited" }, 429, { "retry-after": "60" });
       }
     }
 
     const res = await getProvider(o.origin).fetch(req, env, ctx);
+    // Charge the forge budget only when the provider rejects an owner-shaped token.
+    // A token it accepts is remembered in apiHandler and is not counted here.
+    if (forgeFp && forgeAdmit === "allow" && res.status === 401) {
+      await queueStub(env).rateLimit("mcp:forge", MCP_FORGE_PER_MIN, 60_000);
+    }
     logLine("req", { route: routeLabel(path), status: res.status });
     return res;
   },
@@ -137,9 +166,12 @@ function tokenUserHint(token: string): string | null {
 }
 
 function expectedOwnerUser(env: Env): string | null {
-  const owner = env.BOXMCP_OWNER_GITHUB_ID?.trim() ?? "";
-  if (!/^\d+$/.test(owner) || owner === "0") return null;
-  return `github-${owner}`;
+  const owner = validOwnerId(env.BOXMCP_OWNER_GITHUB_ID);
+  return owner ? `github-${owner}` : null;
+}
+
+async function tokenFingerprint(token: string): Promise<string> {
+  return (await sha256Hex(token)).slice(0, 32);
 }
 
 function ownerShapedBearer(req: Request, env: Env): boolean {

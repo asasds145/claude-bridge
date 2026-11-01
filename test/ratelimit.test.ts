@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { queueStub } from "../src/env";
 import { MAX_PUBLIC_BUCKETS, type BoxmcpQueue } from "../src/queue";
 
@@ -8,6 +8,14 @@ const KEY = "test-chief-key-not-a-secret";
 type Buckets = Map<string, { count: number; resetAt: number }>;
 const trustedOf = (inst: BoxmcpQueue) => (inst as unknown as { buckets: Buckets }).buckets;
 const publicOf = (inst: BoxmcpQueue) => (inst as unknown as { publicBuckets: Buckets }).publicBuckets;
+
+beforeEach(async () => {
+  await runInDurableObject(queueStub(env as never), (inst: BoxmcpQueue) => {
+    const buckets = (inst as unknown as { buckets: Map<string, unknown> }).buckets;
+    buckets.delete("mcp:unauth");
+    buckets.delete("mcp:forge");
+  });
+});
 
 describe("rate limit", () => {
   it("/chief 60/min → 61st is 429", async () => {

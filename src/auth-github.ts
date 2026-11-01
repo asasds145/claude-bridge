@@ -30,8 +30,23 @@ function errorPage(status: number, msg: string): Response {
   return page("chief-bridge", `<h1>chief-bridge</h1><p>${escapeAttr(msg)}</p>`, status);
 }
 
+/** Numeric GitHub user id. Rejects 0, leading zeros, and non-digits so a bad value fails closed. */
+export function validOwnerId(raw: string | undefined): string | null {
+  const owner = raw?.trim() ?? "";
+  if (!/^[1-9]\d*$/.test(owner)) return null;
+  return owner;
+}
+
 function configured(env: Env): boolean {
-  return Boolean(env.GITHUB_CLIENT_SECRET && env.GITHUB_CLIENT_ID && env.BOXMCP_OWNER_GITHUB_ID && env.BOXMCP_OWNER_GITHUB_ID !== "0");
+  if (!env.GITHUB_CLIENT_SECRET || !env.GITHUB_CLIENT_ID) return false;
+  const owner = env.BOXMCP_OWNER_GITHUB_ID?.trim() ?? "";
+  if (owner === "" || owner === "0") return false;
+  if (!validOwnerId(owner)) {
+    // Do not log the value: it may be a mistaken paste, and it is not a route or status.
+    logLine("oauth_error", { where: "owner_id", code: "bad_owner_id" });
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -71,8 +86,8 @@ export function ownerUserId(githubId: number): string {
  * Checked on each MCP call so a previous owner's access token stops working after the id changes.
  */
 export function mcpUserMatchesOwner(userId: string | undefined, ownerGithubId: string | undefined): userId is string {
-  const owner = ownerGithubId?.trim() ?? "";
-  if (!/^\d+$/.test(owner) || owner === "0") return false;
+  const owner = validOwnerId(ownerGithubId);
+  if (!owner) return false;
   return userId === `github-${owner}`;
 }
 

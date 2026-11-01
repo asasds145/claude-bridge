@@ -1,9 +1,9 @@
 import { createExecutionContext, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CLAUDE_REDIRECT_URI } from "../src/auth-github";
 import { queueStub } from "../src/env";
-import worker, { MCP_PREAUTH_PER_MIN, MCP_RATE_PER_MIN } from "../src/index";
+import worker, { MCP_FORGE_PER_MIN, MCP_PREAUTH_PER_MIN, MCP_RATE_PER_MIN } from "../src/index";
 import type { BoxmcpQueue } from "../src/queue";
 
 // 테스트 전용 가짜 값 (실제 secret/토큰 아님)
@@ -12,6 +12,15 @@ const CIMD_ID = "https://claude.ai/oauth/mcp-oauth-client-metadata";
 const E = { ...(env as object), GITHUB_CLIENT_SECRET: "fake-github-secret-for-test" } as never;
 
 afterEach(() => vi.restoreAllMocks());
+
+beforeEach(async () => {
+  // These counters live on the shared Durable Object and would otherwise leak between tests.
+  await runInDurableObject(queueStub(env as never), (inst: BoxmcpQueue) => {
+    const buckets = (inst as unknown as { buckets: Map<string, unknown> }).buckets;
+    buckets.delete("mcp:unauth");
+    buckets.delete("mcp:forge");
+  });
+});
 
 /** 브라우저 쿠키 흉내: __Host- 규칙(Secure, Path=/, Domain 없음), Max-Age=0 삭제, SameSite=Lax(top-level GET·same-site POST 전송) */
 class Jar {
@@ -135,10 +144,34 @@ describe("auth helpers", () => {
     expect(mcpUserMatchesOwner("github-12345678", "0")).toBe(false);
     expect(mcpUserMatchesOwner(undefined, "12345678")).toBe(false);
     expect(mcpUserMatchesOwner("github-12345678", undefined)).toBe(false);
+    expect(mcpUserMatchesOwner("github-123", "0123")).toBe(false);
+    const { validOwnerId } = await import("../src/auth-github");
+    expect(validOwnerId("12345678")).toBe("12345678");
+    expect(validOwnerId(" 12345678 ")).toBe("12345678");
+    expect(validOwnerId("0")).toBeNull();
+    expect(validOwnerId("0123")).toBeNull();
+    expect(validOwnerId("12a")).toBeNull();
     expect(mcpActorId({ auth: { userId: "github-12345" }, props: { githubId: 12345 } })).toBe("github-12345");
     expect(mcpActorId({ props: { githubId: 12345 } })).toBe("github-12345");
     expect(mcpActorId({ auth: { userId: "github-12345" } })).toBe("github-12345");
     expect(mcpActorId({ auth: { userId: "github-1" }, props: { githubId: 12345 } })).toBeUndefined();
+  });
+  it("a leading-zero owner id fails closed and the value is not logged", async () => {
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request(`${BASE}/authorize?response_type=code&client_id=x`),
+      { ...(env as object), GITHUB_CLIENT_SECRET: "fake-github-secret-for-test", BOXMCP_OWNER_GITHUB_ID: "012345" } as never,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(503);
+    const joined = logs.join("\n");
+    expect(joined).toContain("bad_owner_id");
+    expect(joined).not.toContain("012345");
   });
   it("errorClass logs the class only, never the message", async () => {
     const { errorClass } = await import("../src/util");
@@ -179,6 +212,7 @@ function mcpInit(token: string): Request {
     method: "POST",
     headers: {
       authorization: `Bearer ${token}`,
+      host: "chief-bridge.test",
       "content-type": "application/json",
       accept: "application/json, text/event-stream",
       "mcp-protocol-version": "2025-06-18",
@@ -212,28 +246,38 @@ async function exchange(code: string): Promise<string> {
   return token as string;
 }
 
+function parseMcp(body: string): { error?: unknown; result?: { protocolVersion?: string; serverInfo?: { name?: string; version?: string } } } {
+  const dataLine = body.split("\n").find((l) => l.startsWith("data:"));
+  return JSON.parse(dataLine ? dataLine.slice(5).trim() : body) as { error?: unknown; result?: { protocolVersion?: string; serverInfo?: { name?: string; version?: string } } };
+}
+
+function expectInitialized(status: number, body: string) {
+  expect(status, body).toBe(200);
+  const msg = parseMcp(body);
+  expect(msg.error).toBeUndefined();
+  expect(msg.result?.protocolVersion).toBeTruthy();
+  expect(msg.result?.serverInfo).toMatchObject({ name: "chief-bridge", version: "1.0.0" });
+}
+
 describe("authenticated /mcp", () => {
-  it("code exchange then /mcp is not 401, survives a full unauth bucket, and 401s after an owner change", async () => {
+  it("code exchange then /mcp initialize is 200, and a full unauth bucket does not block it or a headerless probe", async () => {
     const c = await flow(12345);
     const loc = new URL(c.headers.get("location")!);
     const code = loc.searchParams.get("code");
     expect(code).toBeTruthy();
     const token = await exchange(code as string);
     const ok = await call(mcpInit(token));
-    const okBody = await ok.text();
-    expect(ok.status, okBody).not.toBe(401);
-    expect(ok.status, okBody).not.toBe(429);
+    expectInitialized(ok.status, await ok.text());
 
     const stub = queueStub(env as never);
+    const bucketMap = (inst: BoxmcpQueue) => (inst as unknown as { buckets: Map<string, { count: number; resetAt: number }> }).buckets;
     await runInDurableObject(stub, (inst: BoxmcpQueue) => {
-      (inst as unknown as { buckets: Map<string, { count: number; resetAt: number }> }).buckets.set("mcp:unauth", {
-        count: MCP_PREAUTH_PER_MIN,
-        resetAt: Date.now() + 60_000,
-      });
+      bucketMap(inst).set("mcp:unauth", { count: MCP_PREAUTH_PER_MIN, resetAt: Date.now() + 60_000 });
     });
     try {
       const anon = await call(new Request(`${BASE}/mcp`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }));
-      expect(anon.status).toBe(429);
+      expect(anon.status).toBe(401);
+      expect(anon.headers.get("www-authenticate") ?? "").toContain(`resource_metadata="${BASE}/.well-known/oauth-protected-resource/mcp"`);
       const junk = await call(new Request(`${BASE}/mcp`, {
         method: "POST",
         headers: { authorization: "Bearer not-a-token", "content-type": "application/json" },
@@ -241,14 +285,39 @@ describe("authenticated /mcp", () => {
       }));
       expect(junk.status).toBe(429);
       const still = await call(mcpInit(token));
-      const stillBody = await still.text();
-      expect(still.status, stillBody).not.toBe(401);
-      expect(still.status, stillBody).not.toBe(429);
+      expectInitialized(still.status, await still.text());
     } finally {
       await runInDurableObject(stub, (inst: BoxmcpQueue) => {
-        (inst as unknown as { buckets: Map<string, unknown> }).buckets.delete("mcp:unauth");
+        bucketMap(inst).delete("mcp:unauth");
       });
     }
+
+    const forged = "github-12345:forged-grant:forged-secret";
+    const keys = () => runInDurableObject(stub, (inst: BoxmcpQueue) => [...bucketMap(inst).keys()]);
+    const before = new Set(await keys());
+    const forgedRes = await call(new Request(`${BASE}/mcp`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${forged}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: "{}",
+    }));
+    expect(forgedRes.status).toBe(401);
+    const added = (await keys()).filter((k) => !before.has(k));
+    expect(added.every((k) => k === "mcp:forge")).toBe(true);
+    expect(added.join(" ")).not.toContain("forged");
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      bucketMap(inst).set("mcp:forge", { count: MCP_FORGE_PER_MIN, resetAt: Date.now() + 60_000 });
+    });
+    const forgedAgain = await call(new Request(`${BASE}/mcp`, {
+      method: "POST",
+      headers: { authorization: "Bearer github-12345:other-grant:other-secret", "content-type": "application/json" },
+      body: "{}",
+    }));
+    expect(forgedAgain.status).toBe(429);
+    const ownerStill = await call(mcpInit(token));
+    expectInitialized(ownerStill.status, await ownerStill.text());
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      bucketMap(inst).delete("mcp:forge");
+    });
 
     const ctx = createExecutionContext();
     const denied = await worker.fetch(mcpInit(token), { ...(E as object), BOXMCP_OWNER_GITHUB_ID: "999" } as never, ctx);
@@ -265,7 +334,7 @@ describe("authenticated /mcp", () => {
     for (let i = 0; i < MCP_RATE_PER_MIN + 1; i++) {
       statuses.push((await call(mcpInit(token))).status);
     }
-    expect(statuses.slice(0, MCP_RATE_PER_MIN).every((s) => s !== 401 && s !== 429)).toBe(true);
+    expect(statuses.slice(0, MCP_RATE_PER_MIN).every((s) => s === 200)).toBe(true);
     expect(statuses[MCP_RATE_PER_MIN]).toBe(429);
   }, 30_000);
 });
