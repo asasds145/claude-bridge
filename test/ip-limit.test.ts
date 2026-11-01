@@ -103,6 +103,16 @@ describe("IP rate limit binding", () => {
     expect(blocked.headers.get("retry-after")).toBe("60");
   }, 15_000);
 
+  it("an /mcp flood does not 429 registration from the same address", async () => {
+    await waitForFreshRateWindow();
+    const ip = "192.0.2.90";
+    for (let i = 0; i < TEST_IP_LIMIT; i++) {
+      expect((await call(mcp(ip, "Bearer not-a-token"))).status).toBe(401);
+    }
+    const reg = await call(register(ip));
+    expect(reg.status).not.toBe(429);
+  }, 15_000);
+
   it("429s POST /oauth/register from a limited address without touching the DO", async () => {
     await waitForFreshRateWindow();
     const ip = "192.0.2.70";

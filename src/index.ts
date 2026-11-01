@@ -145,8 +145,13 @@ export default {
       if (ipBlock) return ipBlock;
       // Fixed shard, public map. One address cannot mint a key, and these keys cannot fill the trusted map.
       const shard = (await sha256Hex(ipRateLimitMaterial(clientIp(req)))).slice(0, REGISTER_SHARD_HEX);
-      const rl = await queueStub(env).rateLimitPublic(`register:${shard}`, REGISTER_RATE_PER_HOUR, 3600_000);
-      if (!rl.ok) return json({ error: "rate_limited" }, 429, { "retry-after": String(rl.retryAfter) });
+      try {
+        const rl = await queueStub(env).rateLimitPublic(`register:${shard}`, REGISTER_RATE_PER_HOUR, 3600_000);
+        if (!rl.ok) return json({ error: "rate_limited" }, 429, { "retry-after": String(rl.retryAfter) });
+      } catch (e) {
+        logLine("req", { route: "/oauth/register", status: 429, error_class: errorClass(e) });
+        return json({ error: "rate_limited" }, 429, { "retry-after": "60" });
+      }
     }
 
     // workers-oauth-provider 1.2.4 matchApiRoute: exact "/mcp" or a descendant "/mcp/...". "/mcpx" is not an API route.

@@ -92,7 +92,7 @@ export class BoxmcpQueue extends DurableObject<Env> {
    * One-shot fault for tests, set only from inside the isolate. No request path writes it.
    * Cleared when it fires so a later call is not stuck failing.
    */
-  faultOnce: "releaseForge" | "ownerAccepted" | "reserveForge" | "rateLimit" | null = null;
+  __testFaultOnce: "releaseForge" | "ownerAccepted" | "reserveForge" | "rateLimit" | "rateLimitPublic" | null = null;
   /** Keys an unauthenticated caller can multiply (registration shards). Capped separately. */
   private publicBuckets = new Map<string, { count: number; resetAt: number }>();
 
@@ -148,6 +148,7 @@ export class BoxmcpQueue extends DurableObject<Env> {
   }
 
   async rateLimitPublic(key: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
+    this.throwIfFault("rateLimitPublic");
     return this.limitIn(this.publicBuckets, key, limit, windowMs, MAX_PUBLIC_BUCKETS);
   }
 
@@ -254,9 +255,9 @@ export class BoxmcpQueue extends DurableObject<Env> {
     else this.sql.exec(`DELETE FROM accepted_grants WHERE seen_at < ?`, cutoff);
   }
 
-  private throwIfFault(op: NonNullable<BoxmcpQueue["faultOnce"]>): void {
-    if (this.faultOnce !== op) return;
-    this.faultOnce = null;
+  private throwIfFault(op: NonNullable<BoxmcpQueue["__testFaultOnce"]>): void {
+    if (this.__testFaultOnce !== op) return;
+    this.__testFaultOnce = null;
     throw new Error("do-fault");
   }
 

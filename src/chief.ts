@@ -1,5 +1,5 @@
 import { type Env, queueStub } from "./env";
-import { HttpError, MAX_TEXT, THREAD_ID_RE, json, logLine, readJsonLimited, routeLabel, safeEqual, type StoredMessage } from "./util";
+import { HttpError, MAX_TEXT, THREAD_ID_RE, errorClass, json, logLine, readJsonLimited, routeLabel, safeEqual, type StoredMessage } from "./util";
 
 export const CHIEF_RATE_PER_MIN = 60;
 
@@ -38,7 +38,13 @@ export async function handleChief(req: Request, env: Env): Promise<Response> {
     return json({ error: "unauthorized" }, 401, { "www-authenticate": 'Bearer realm="chief-bridge-chief"' });
   }
   const stub = queueStub(env);
-  const rl = await stub.rateLimit("chief", CHIEF_RATE_PER_MIN, 60_000);
+  let rl: { ok: boolean; retryAfter: number };
+  try {
+    rl = await stub.rateLimit("chief", CHIEF_RATE_PER_MIN, 60_000);
+  } catch (e) {
+    logLine("chief", { route, status: 429, error_class: errorClass(e) });
+    return json({ error: "rate_limited" }, 429, { "retry-after": "60" });
+  }
   if (!rl.ok) return json({ error: "rate_limited" }, 429, { "retry-after": String(rl.retryAfter) });
 
   try {

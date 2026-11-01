@@ -666,7 +666,7 @@ describe("grant recording and forge refunds", () => {
       const stub = queueStub(env as never);
       await runInDurableObject(stub, (inst: BoxmcpQueue, state) => {
         state.storage.sql.exec(`DELETE FROM accepted_grants WHERE grant_id = ?`, grantId);
-        inst.faultOnce = "releaseForge";
+        inst.__testFaultOnce = "releaseForge";
       });
       const res = await call(mcpInit(issued.access_token, "203.0.113.210"));
       const body = await res.text();
@@ -901,7 +901,7 @@ describe("grant recording and forge refunds", () => {
     const issued = await issuedToken();
     const stub = queueStub(env as never);
     await runInDurableObject(stub, (inst: BoxmcpQueue) => {
-      inst.faultOnce = "ownerAccepted";
+      inst.__testFaultOnce = "ownerAccepted";
     });
     const res = await call(mcpInit(issued.access_token, "203.0.113.233"));
     const body = await res.text();

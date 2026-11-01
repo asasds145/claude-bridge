@@ -24,7 +24,7 @@ export async function resetSharedDurableState(): Promise<void> {
     }
     view.publicBuckets.clear();
     view.forgeTrickleAt = Date.now();
-    (inst as unknown as { faultOnce: null }).faultOnce = null;
+    (inst as unknown as { __testFaultOnce: null }).__testFaultOnce = null;
     // Webhook tests replace inst.env. Put the worker env back so a later test does not keep that override.
     (inst as unknown as { env: unknown }).env = env;
     state.storage.sql.exec(`DELETE FROM accepted_grants`);

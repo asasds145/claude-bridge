@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { queueStub } from "../src/env";
 import { MCP_FORGE_PER_MIN, MCP_PREAUTH_PER_MIN, REFRESH_TOKEN_TTL } from "../src/index";
 import { GRANT_TTL_MS, GRANT_TOUCH_MS, MAX_PUBLIC_BUCKETS, type BoxmcpQueue } from "../src/queue";
@@ -335,7 +335,7 @@ describe("rate limit", () => {
         body: "{}",
       }));
     await runInDurableObject(stub, (inst: BoxmcpQueue) => {
-      inst.faultOnce = "rateLimit";
+      inst.__testFaultOnce = "rateLimit";
     });
     const unauth = await post("198.51.100.220", "Bearer not-a-token");
     const unauthBody = await unauth.text();
@@ -345,7 +345,7 @@ describe("rate limit", () => {
     expect(unauth.headers.get("retry-after")).toBe("60");
 
     await runInDurableObject(stub, (inst: BoxmcpQueue) => {
-      inst.faultOnce = "reserveForge";
+      inst.__testFaultOnce = "reserveForge";
     });
     const forged = await post("198.51.100.221", `Bearer github-12345:${"q".repeat(16)}:${"s".repeat(32)}`);
     const forgedBody = await forged.text();
@@ -353,6 +353,70 @@ describe("rate limit", () => {
     expect(forgedBody).not.toContain("do-fault");
     expect(forged.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
     expect(forged.headers.get("retry-after")).toBe("60");
+  });
+
+  it("a thrown registration or chief limit is 429, then the next call succeeds", async () => {
+    const stub = queueStub(env as never);
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    const logged = (event: string) =>
+      logs
+        .map((line) => {
+          try {
+            return JSON.parse(line) as { event?: string; error_class?: string };
+          } catch {
+            return null;
+          }
+        })
+        .filter((line) => line?.event === event);
+    try {
+      await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+        inst.__testFaultOnce = "rateLimitPublic";
+      });
+      const denied = await exports.default.fetch(new Request("https://chief-bridge.test/oauth/register", {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "198.51.100.230" },
+        body: JSON.stringify({ redirect_uris: ["https://claude.ai/api/mcp/auth_callback"], token_endpoint_auth_method: "none" }),
+      }));
+      const deniedBody = await denied.text();
+      expect(denied.status).toBe(429);
+      expect(denied.headers.get("retry-after")).toBe("60");
+      expect(deniedBody).not.toContain("do-fault");
+      const registerLog = logged("req").find((line) => line?.error_class === "Error");
+      expect(registerLog?.error_class).toBe("Error");
+      expect(JSON.stringify(registerLog)).not.toContain("do-fault");
+
+      const next = await exports.default.fetch(new Request("https://chief-bridge.test/oauth/register", {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-connecting-ip": "198.51.100.230" },
+        body: JSON.stringify({ redirect_uris: ["https://claude.ai/api/mcp/auth_callback"], token_endpoint_auth_method: "none" }),
+      }));
+      expect(next.status).toBe(201);
+
+      logs.length = 0;
+      await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+        inst.__testFaultOnce = "rateLimit";
+      });
+      const chiefDenied = await exports.default.fetch(new Request("https://chief-bridge.test/chief/health", {
+        headers: { authorization: `Bearer ${KEY}` },
+      }));
+      const chiefBody = await chiefDenied.text();
+      expect(chiefDenied.status).toBe(429);
+      expect(chiefDenied.headers.get("retry-after")).toBe("60");
+      expect(chiefBody).not.toContain("do-fault");
+      const chiefLog = logged("chief").find((line) => line?.error_class === "Error");
+      expect(chiefLog?.error_class).toBe("Error");
+      expect(JSON.stringify(chiefLog)).not.toContain("do-fault");
+
+      const chiefNext = await exports.default.fetch(new Request("https://chief-bridge.test/chief/health", {
+        headers: { authorization: `Bearer ${KEY}` },
+      }));
+      expect(chiefNext.status).toBe(200);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("a full public map does not refuse trusted keys, and expired public keys are reclaimed", async () => {
