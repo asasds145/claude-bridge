@@ -4,8 +4,8 @@ import { handleAuthUi, mcpActorId, mcpUserMatchesOwner, validOwnerId } from "./a
 import { handleChief } from "./chief";
 import { type Env, queueStub } from "./env";
 import { createServer } from "./mcp";
-import { REGISTER_SHARD_HEX } from "./queue";
-import { MAX_BODY_BYTES, clientIp, errorClass, json, logLine, routeLabel, sha256Hex } from "./util";
+import { GRANT_TTL_MS, REGISTER_SHARD_HEX } from "./queue";
+import { MAX_BODY_BYTES, clientIp, errorClass, ipRateLimitMaterial, json, logLine, routeLabel, sha256Hex } from "./util";
 
 export { BoxmcpQueue } from "./queue";
 
@@ -20,15 +20,13 @@ export const MCP_PREAUTH_PER_MIN = 120;
  * and released if the provider accepts the token. Stored grants skip this budget.
  */
 export const MCP_FORGE_PER_MIN = 60;
-/**
- * Lookups for a grant id that is already stored. The id is not the secret, so these still take a slot
- * before KV. Separate from mcp:forge so a flood of unknown forgeries cannot crowd out a recorded login.
- */
-export const MCP_KNOWN_PER_MIN = 120;
 export const REGISTER_RATE_PER_HOUR = 5;
 export const ACCESS_TOKEN_TTL = 3600;
 /** 30 days. Matches workers-oauth-provider's default, set explicitly so a grant cannot live forever. Refresh does not extend it. */
-export const REFRESH_TOKEN_TTL = 30 * 24 * 60 * 60;
+export const REFRESH_TOKEN_TTL = GRANT_TTL_MS / 1000;
+
+/** githubId apiHandler just accepted. Tests read this; it is never logged. */
+export const acceptedOwnerProps: { githubId?: number } = {};
 
 const defaultHandler: ExportedHandler<Env> = {
   async fetch(req, env) {
@@ -73,8 +71,17 @@ function getProvider(origin: string): OAuthProvider<Env> {
           logLine("mcp_auth", { status: 401, code: "owner_mismatch" });
           return markAuth(mcpUnauthorized(origin), "mismatch");
         }
-        if (grantId) await queueStub(env).rememberOwnerGrant(grantId);
-        const rl = await queueStub(env).rateLimit(`mcp:${userId}`, MCP_RATE_PER_MIN, 60_000);
+        const propsId = (ctx as { props?: { githubId?: number } }).props?.githubId;
+        acceptedOwnerProps.githubId = typeof propsId === "number" ? propsId : undefined;
+        // One RPC records the grant and applies the per-user limit. A grant-write error is logged inside
+        // and does not fail this call. If the RPC itself fails, do not serve the tool call with no limit.
+        let rl: { ok: boolean; retryAfter: number };
+        try {
+          rl = await queueStub(env).ownerAccepted(grantId ?? "", `mcp:${userId}`, MCP_RATE_PER_MIN, 60_000);
+        } catch (e) {
+          logLine("grant_record", { error_class: errorClass(e) });
+          return markAuth(mcpLimited(origin, 60), "owner");
+        }
         if (!rl.ok) return markAuth(mcpLimited(origin, rl.retryAfter), "owner");
         return markAuth(await mcp(req, env, ctx), "owner");
       },
@@ -129,18 +136,21 @@ export default {
     if ("error" in o) return o.error;
 
     if (path === "/oauth/register" && req.method === "POST") {
+      // Same IP binding as /mcp, before the registration shard touches the Durable Object.
+      const ipBlock = await rejectIfIpLimited(req, env, "register");
+      if (ipBlock) return ipBlock;
       // Fixed shard, public map. One address cannot mint a key, and these keys cannot fill the trusted map.
-      const shard = (await sha256Hex(clientIp(req))).slice(0, REGISTER_SHARD_HEX);
+      const shard = (await sha256Hex(ipRateLimitMaterial(clientIp(req)))).slice(0, REGISTER_SHARD_HEX);
       const rl = await queueStub(env).rateLimitPublic(`register:${shard}`, REGISTER_RATE_PER_HOUR, 3600_000);
       if (!rl.ok) return json({ error: "rate_limited" }, 429, { "retry-after": String(rl.retryAfter) });
     }
 
     // workers-oauth-provider 1.2.4 matchApiRoute: exact "/mcp" or a descendant "/mcp/...". "/mcpx" is not an API route.
     const mcpPath = path === "/mcp" || path.startsWith("/mcp/");
-    let refund: { bucket: "forge" | "known"; resetAt: number } | null = null;
+    let refundResetAt: number | null = null;
     if (mcpPath) {
       // Before any Durable Object call. A flood should die here, not on the single queue object.
-      const ipBlock = await rejectIfMcpIpLimited(req, env, o.origin);
+      const ipBlock = await rejectIfIpLimited(req, env, "mcp");
       if (ipBlock) return ipBlock;
       const cls = classifyMcpAuth(req, env);
       if (cls.kind === "unauth") {
@@ -150,23 +160,26 @@ export default {
           return mcpLimited(o.origin, rl.retryAfter);
         }
       } else if (cls.kind === "forge") {
-        // One DO call reserves the slot before KV. A stored grant uses mcp:known, not an unlimited skip.
-        const slot = await queueStub(env).reserveForge(cls.grantId, MCP_FORGE_PER_MIN, 60_000, MCP_KNOWN_PER_MIN);
+        // One DO call reserves the slot before KV. A stored grant skips the budget entirely.
+        const slot = await queueStub(env).reserveForge(cls.grantId, MCP_FORGE_PER_MIN, 60_000);
         if (slot.action === "deny") {
           logLine("req", { route: routeLabel(path), status: 429 });
           return mcpLimited(o.origin, slot.retryAfter);
         }
-        if (slot.action === "reserved" && slot.refundable) refund = { bucket: slot.bucket, resetAt: slot.resetAt };
+        if (slot.action === "reserved" && slot.refundable) refundResetAt = slot.resetAt;
       }
     }
 
     const raw = await getProvider(o.origin).fetch(req, env, ctx);
     const { res, mark } = stripAuthMark(raw);
     // Only a fully owner-validated token returns its slot, and only in the window that reservation used.
-    if (refund && mark === "owner") {
-      const stub = queueStub(env);
-      if (refund.bucket === "known") await stub.releaseKnown(refund.resetAt);
-      else await stub.releaseForge(refund.resetAt);
+    // A refund failure must not replace the response the provider already produced.
+    if (refundResetAt !== null && mark === "owner") {
+      try {
+        await queueStub(env).releaseForge(refundResetAt);
+      } catch (e) {
+        logLine("forge_refund", { error_class: errorClass(e) });
+      }
     }
     logLine("req", { route: routeLabel(path), status: res.status });
     return res;
@@ -233,29 +246,32 @@ const MCP_IP_RETRY_AFTER = 60;
 const MCP_IP_ABSENT_KEY = "no-connecting-ip";
 
 /**
- * Shed Authorization-bearing /mcp traffic before the Durable Object.
- * No Authorization header: not counted. Those are a cheap 401, including connector probes.
+ * Shed traffic before the Durable Object.
+ * /mcp counts only when Authorization is present: a missing header is a cheap 401, including connector probes.
+ * POST /oauth/register counts every request, because that path has no Authorization header and otherwise hits the object.
  * Missing binding or a thrown limit() fails open and logs a fixed label. Fail closed would lock the owner out of a misconfig.
  */
-async function rejectIfMcpIpLimited(req: Request, env: Env, origin: string): Promise<Response | null> {
-  if (req.headers.get("authorization") === null) return null;
+async function rejectIfIpLimited(req: Request, env: Env, mode: "mcp" | "register"): Promise<Response | null> {
+  if (mode === "mcp" && req.headers.get("authorization") === null) return null;
+  const route = mode === "mcp" ? "/mcp" : "/oauth/register";
   const limiter = env.MCP_IP_LIMITER;
   if (!limiter) {
-    logLine("req", { route: "/mcp", rate_limiter: "missing" });
+    logLine("req", { route, rate_limiter: "missing" });
     return null;
   }
   const ip = req.headers.get("cf-connecting-ip");
-  // The rate-limit key can be retained by the binding. Store a hash, not the address.
-  const key = ip ? await sha256Hex(ip) : MCP_IP_ABSENT_KEY;
+  // The rate-limit key can be retained by the binding. Store a hash of the /64 or the IPv4 address, not the raw header.
+  const key = ip ? await sha256Hex(ipRateLimitMaterial(ip)) : MCP_IP_ABSENT_KEY;
   try {
     const outcome = await limiter.limit({ key });
     if (outcome.success) return null;
   } catch (e) {
-    logLine("req", { route: "/mcp", rate_limiter: "error", error_class: errorClass(e) });
+    logLine("req", { route, rate_limiter: "error", error_class: errorClass(e) });
     return null;
   }
-  logLine("req", { route: "/mcp", status: 429, rate_limiter: "limited" });
-  return mcpLimited(origin, MCP_IP_RETRY_AFTER);
+  logLine("req", { route, status: 429, rate_limiter: "limited" });
+  if (mode === "register") return json({ error: "rate_limited" }, 429, { "retry-after": String(MCP_IP_RETRY_AFTER) });
+  return mcpLimited(new URL(req.url).origin, MCP_IP_RETRY_AFTER);
 }
 
 type McpAuthClass = { kind: "none" } | { kind: "unauth" } | { kind: "forge"; grantId: string };

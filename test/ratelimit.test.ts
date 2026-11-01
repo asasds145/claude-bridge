@@ -2,8 +2,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 import { queueStub } from "../src/env";
-import { MCP_FORGE_PER_MIN, MCP_PREAUTH_PER_MIN } from "../src/index";
-import { GRANT_TOUCH_MS, MAX_PUBLIC_BUCKETS, type BoxmcpQueue } from "../src/queue";
+import { MCP_FORGE_PER_MIN, MCP_PREAUTH_PER_MIN, REFRESH_TOKEN_TTL } from "../src/index";
+import { GRANT_TTL_MS, GRANT_TOUCH_MS, MAX_PUBLIC_BUCKETS, type BoxmcpQueue } from "../src/queue";
 import { resetSharedDurableState } from "./isolate";
 
 const KEY = "test-chief-key-not-a-secret";
@@ -194,9 +194,11 @@ describe("rate limit", () => {
     const oldest = ("o" + "1".padStart(15, "0")).slice(0, 16);
     const newest = ("n" + "0".repeat(15)).slice(0, 16);
     const result = await runInDurableObject(stub, async (inst: BoxmcpQueue, state) => {
+      const now = Date.now();
       for (let i = 1; i <= 32; i++) {
         const id = ("o" + String(i).padStart(15, "0")).slice(0, 16);
-        state.storage.sql.exec(`INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?)`, id, i);
+        // Recent enough to survive the 30-day prune, and strictly ordered so i=1 is the oldest.
+        state.storage.sql.exec(`INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?)`, id, now - 120_000 + i);
       }
       await inst.rememberOwnerGrant(newest);
       const rows = state.storage.sql
@@ -270,6 +272,30 @@ describe("rate limit", () => {
     });
     expect(result.skipped).toBe(frozen - (GRANT_TOUCH_MS - 1));
     expect(result.written).toBe(frozen);
+  });
+
+  it("drops grant rows older than the refresh lifetime when a row is written", async () => {
+    expect(GRANT_TTL_MS).toBe(REFRESH_TOKEN_TTL * 1000);
+    const stub = queueStub(env as never);
+    const expired = ("e" + "1".padStart(15, "0")).slice(0, 16);
+    const boundary = ("d" + "2".padStart(15, "0")).slice(0, 16);
+    const fresh = ("f" + "3".padStart(15, "0")).slice(0, 16);
+    const frozen = 1_800_000_000_000;
+    const realNow = Date.now;
+    const ids = await runInDurableObject(stub, async (inst: BoxmcpQueue, state) => {
+      Date.now = () => frozen;
+      try {
+        state.storage.sql.exec(`INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?)`, expired, frozen - GRANT_TTL_MS - 1);
+        state.storage.sql.exec(`INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?)`, boundary, frozen - GRANT_TTL_MS);
+        await inst.rememberOwnerGrant(fresh);
+        return state.storage.sql.exec<{ grant_id: string }>(`SELECT grant_id FROM accepted_grants`).toArray().map((r) => r.grant_id);
+      } finally {
+        Date.now = realNow;
+      }
+    });
+    expect(ids).toContain(fresh);
+    expect(ids).toContain(boundary);
+    expect(ids).not.toContain(expired);
   });
 
   it("a full public map does not refuse trusted keys, and expired public keys are reclaimed", async () => {

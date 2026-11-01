@@ -17,7 +17,6 @@ export async function resetSharedDurableState(): Promise<void> {
         key === "send_to_chief" ||
         key === "mcp:unauth" ||
         key === "mcp:forge" ||
-        key === "mcp:known" ||
         key.startsWith("mcp:github-")
       ) {
         view.buckets.delete(key);

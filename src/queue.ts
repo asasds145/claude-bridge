@@ -29,11 +29,17 @@ export const MAX_ACCEPTED_GRANTS = 32;
 export const FORGE_TRICKLE_MS = 5_000;
 /** Skip a SQLite rewrite when this grant was already stored more recently than this. */
 export const GRANT_TOUCH_MS = 60_000;
+/**
+ * Same duration as refreshTokenTTL. A row older than this cannot still be a live refresh grant.
+ * index.ts re-exports it in seconds for the OAuth provider.
+ */
+export const GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const HOUR = 3600 * 1000;
 
 export type ForgeReservation =
-  | { action: "reserved"; bucket: "forge" | "known"; refundable: boolean; retryAfter: number; resetAt: number }
-  | { action: "deny"; bucket: "forge" | "known"; retryAfter: number };
+  | { action: "known"; retryAfter: 0 }
+  | { action: "reserved"; refundable: boolean; retryAfter: number; resetAt: number }
+  | { action: "deny"; retryAfter: number };
 
 export type WebhookBlockReason = "non_https" | "invalid_url" | "missing_key";
 
@@ -140,15 +146,47 @@ export class BoxmcpQueue extends DurableObject<Env> {
   }
 
   /**
-   * Serialized by the Durable Object input gate, so a parallel burst cannot reserve more than `limit` lookups.
-   * A stored grant id is not the secret: those lookups use mcp:known, not an unlimited skip, and not mcp:forge
-   * (unknown forgeries must not be able to fill the bucket a recorded login uses). seen_at is not touched here.
+   * One RPC for an accepted owner call: record the grant, then apply the per-user limit.
+   * A grant-write failure is logged and does not fail the RPC, so the caller still rate-limits and answers.
    */
-  async reserveForge(grantId: string, limit: number, windowMs: number, knownLimit = limit): Promise<ForgeReservation> {
-    if (ACCEPTED_GRANT_RE.test(grantId) && this.ownerGrantKnown(grantId)) {
-      return this.reserveNamed("mcp:known", knownLimit, windowMs, false);
+  async ownerAccepted(grantId: string, rateKey: string, limit: number, windowMs: number): Promise<{ ok: boolean; retryAfter: number }> {
+    if (grantId) {
+      try {
+        await this.rememberOwnerGrant(grantId);
+      } catch (e) {
+        logLine("grant_record", { error_class: errorClass(e) });
+      }
     }
-    return this.reserveNamed("mcp:forge", limit, windowMs, true);
+    return this.rateLimit(rateKey, limit, windowMs);
+  }
+
+  /**
+   * Serialized by the Durable Object input gate, so a parallel burst cannot reserve more than `limit` lookups.
+   * A stored grant skips this budget. There is no shared pre-validation bucket: one known grant id must not
+   * be able to lock out the owner. Per-address KV lookups are bounded by the IP limiter instead.
+   * seen_at is not touched here.
+   */
+  async reserveForge(grantId: string, limit: number, windowMs: number): Promise<ForgeReservation> {
+    if (ACCEPTED_GRANT_RE.test(grantId) && this.ownerGrantKnown(grantId)) {
+      return { action: "known", retryAfter: 0 };
+    }
+    const now = Date.now();
+    let b = this.buckets.get("mcp:forge");
+    if (!b || b.resetAt <= now) {
+      b = { count: 0, resetAt: now + windowMs };
+      this.buckets.set("mcp:forge", b);
+    }
+    const retryAfter = Math.max(1, Math.ceil((b.resetAt - now) / 1000));
+    if (b.count < limit) {
+      b.count++;
+      return { action: "reserved", refundable: true, retryAfter, resetAt: b.resetAt };
+    }
+    // One lookup when the cap is full. It does not add a slot that can be refunded.
+    if (now - this.forgeTrickleAt >= FORGE_TRICKLE_MS) {
+      this.forgeTrickleAt = now;
+      return { action: "reserved", refundable: false, retryAfter, resetAt: b.resetAt };
+    }
+    return { action: "deny", retryAfter };
   }
 
   /**
@@ -156,42 +194,7 @@ export class BoxmcpQueue extends DurableObject<Env> {
    * A refund from an earlier window must not credit the window that replaced it.
    */
   async releaseForge(resetAt: number): Promise<void> {
-    this.releaseBucket("mcp:forge", resetAt);
-  }
-
-  /** Same window rule as releaseForge, for the stored-grant lookup budget. */
-  async releaseKnown(resetAt: number): Promise<void> {
-    this.releaseBucket("mcp:known", resetAt);
-  }
-
-  private reserveNamed(
-    bucket: "mcp:forge" | "mcp:known",
-    limit: number,
-    windowMs: number,
-    allowTrickle: boolean,
-  ): ForgeReservation {
-    const now = Date.now();
-    let b = this.buckets.get(bucket);
-    if (!b || b.resetAt <= now) {
-      b = { count: 0, resetAt: now + windowMs };
-      this.buckets.set(bucket, b);
-    }
-    const retryAfter = Math.max(1, Math.ceil((b.resetAt - now) / 1000));
-    const kind = bucket === "mcp:known" ? "known" : "forge";
-    if (b.count < limit) {
-      b.count++;
-      return { action: "reserved", bucket: kind, refundable: true, retryAfter, resetAt: b.resetAt };
-    }
-    // Trickle is only for unknown owner-shaped tokens. It does not add a slot that can be refunded.
-    if (allowTrickle && now - this.forgeTrickleAt >= FORGE_TRICKLE_MS) {
-      this.forgeTrickleAt = now;
-      return { action: "reserved", bucket: kind, refundable: false, retryAfter, resetAt: b.resetAt };
-    }
-    return { action: "deny", bucket: kind, retryAfter };
-  }
-
-  private releaseBucket(bucket: string, resetAt: number): void {
-    const b = this.buckets.get(bucket);
+    const b = this.buckets.get("mcp:forge");
     if (!b || b.resetAt !== resetAt || b.count <= 0) return;
     b.count--;
   }
@@ -210,6 +213,8 @@ export class BoxmcpQueue extends DurableObject<Env> {
       grantId,
       now,
     );
+    // A refresh grant cannot outlive REFRESH_TOKEN_TTL, so a row older than that is not a live login.
+    this.sql.exec(`DELETE FROM accepted_grants WHERE grant_id <> ? AND seen_at < ?`, grantId, now - GRANT_TTL_MS);
     // Always keep the row just written. An UPDATE does not change rowid, so a tie on seen_at
     // ordered only by rowid could otherwise evict it. Among the rest, higher rowid wins a tie.
     this.sql.exec(

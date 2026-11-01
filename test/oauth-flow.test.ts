@@ -1,10 +1,12 @@
 import { createExecutionContext, evictDurableObject, runInDurableObject, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CLAUDE_REDIRECT_URI, mcpActorId } from "../src/auth-github";
+import { CLAUDE_REDIRECT_URI } from "../src/auth-github";
 import { queueStub } from "../src/env";
-import worker, { MCP_FORGE_PER_MIN, MCP_KNOWN_PER_MIN, MCP_PREAUTH_PER_MIN, MCP_RATE_PER_MIN } from "../src/index";
-import type { BoxmcpQueue } from "../src/queue";
+import * as envModule from "../src/env";
+import worker, { acceptedOwnerProps, MCP_FORGE_PER_MIN, MCP_PREAUTH_PER_MIN, MCP_RATE_PER_MIN } from "../src/index";
+import { BoxmcpQueue } from "../src/queue";
+import { waitForFreshRateWindow } from "./window";
 import { resetSharedDurableState } from "./isolate";
 
 // 테스트 전용 가짜 값 (실제 secret/토큰 아님)
@@ -566,13 +568,169 @@ describe("grant recording and forge refunds", () => {
     expect(afterChange).toBe(0);
   }, 30_000);
 
-  it("keeps scope and githubId across the code grant and the refresh grant", async () => {
-    const seen: Array<number | undefined> = [];
-    const original = mcpActorId;
-    const spy = vi.spyOn(await import("../src/auth-github"), "mcpActorId").mockImplementation((ctx) => {
-      seen.push(ctx.props?.githubId);
-      return original(ctx);
+  it("does not record a grant when the owner id changes between authorize and code exchange", async () => {
+    const done = await flow(12345);
+    const code = new URL(done.headers.get("location")!).searchParams.get("code");
+    expect(code).toBeTruthy();
+    const stub = queueStub(env as never);
+    await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      state.storage.sql.exec(`DELETE FROM accepted_grants`);
     });
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(new Request(`${BASE}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code as string,
+        redirect_uri: CLAUDE_REDIRECT_URI,
+        client_id: CIMD_ID,
+        code_verifier: CODE_VERIFIER,
+        resource: `${BASE}/mcp`,
+      }),
+    }), { ...(env as object), GITHUB_CLIENT_SECRET: "fake-github-secret-for-test", BOXMCP_OWNER_GITHUB_ID: "67890" } as never, ctx);
+    await waitOnExecutionContext(ctx);
+    const text = await res.text();
+    expect(res.status, text).toBe(200);
+    const stored = await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+      return state.storage.sql.exec(`SELECT grant_id FROM accepted_grants`).toArray().length;
+    });
+    expect(stored).toBe(0);
+  }, 30_000);
+
+  it("still issues a token when recording the grant rejects asynchronously", async () => {
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    try {
+      const done = await flow(12345);
+      const code = new URL(done.headers.get("location")!).searchParams.get("code");
+      expect(code).toBeTruthy();
+      const ctx = createExecutionContext();
+      const broken = {
+        ...(env as object),
+        GITHUB_CLIENT_SECRET: "fake-github-secret-for-test",
+        QUEUE: {
+          idFromName() {
+            return {};
+          },
+          get() {
+            return { rememberOwnerGrant: () => Promise.reject(new Error("async-queue")) };
+          },
+        },
+      };
+      const res = await worker.fetch(new Request(`${BASE}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: code as string,
+          redirect_uri: CLAUDE_REDIRECT_URI,
+          client_id: CIMD_ID,
+          code_verifier: CODE_VERIFIER,
+          resource: `${BASE}/mcp`,
+        }),
+      }), broken as never, ctx);
+      await waitOnExecutionContext(ctx);
+      const text = await res.text();
+      expect(res.status, text).toBe(200);
+      expect((JSON.parse(text) as { access_token?: string }).access_token).toBeTruthy();
+      const recorded = logs
+        .map((line) => {
+          try {
+            return JSON.parse(line) as { event?: string; error_class?: string };
+          } catch {
+            return null;
+          }
+        })
+        .filter((line) => line?.event === "grant_record");
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]?.error_class).toBe("Error");
+      expect(JSON.stringify(recorded[0])).not.toContain("async-queue");
+    } finally {
+      spy.mockRestore();
+    }
+  }, 30_000);
+
+  it("keeps a successful /mcp response when the forge refund rejects", async () => {
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    // Reject on the worker side. A throw inside the Durable Object is reported as uncaught
+    // even when this fetch handler catches it.
+    const realQueueStub = queueStub;
+    const stubSpy = vi.spyOn(envModule, "queueStub").mockImplementation((e) => {
+      const stub = realQueueStub(e);
+      return new Proxy(stub, {
+        get(target, prop, receiver) {
+          if (prop === "releaseForge") return () => Promise.reject(new Error("refund-boom"));
+          // Stub methods are already bound by the RPC proxy. Calling bind() on them throws.
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+    });
+    try {
+      const issued = await issuedToken();
+      const grantId = issued.access_token.split(":")[1];
+      const stub = realQueueStub(env as never);
+      await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+        state.storage.sql.exec(`DELETE FROM accepted_grants WHERE grant_id = ?`, grantId);
+      });
+      const res = await call(mcpInit(issued.access_token, "192.0.2.77"));
+      const body = await res.text();
+      expectInitialized(res.status, body);
+      expect(body).not.toContain("refund-boom");
+      const recorded = logs
+        .map((line) => {
+          try {
+            return JSON.parse(line) as { event?: string; error_class?: string };
+          } catch {
+            return null;
+          }
+        })
+        .filter((line) => line?.event === "forge_refund");
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0]?.error_class).toBe("Error");
+      expect(JSON.stringify(recorded[0])).not.toContain("refund-boom");
+    } finally {
+      stubSpy.mockRestore();
+      spy.mockRestore();
+    }
+  }, 30_000);
+
+  it("a grant-write failure after acceptance does not fail /mcp", async () => {
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((line) => {
+      logs.push(String(line));
+    });
+    const issued = await issuedToken();
+    const orig = BoxmcpQueue.prototype.rememberOwnerGrant;
+    BoxmcpQueue.prototype.rememberOwnerGrant = function () {
+      return Promise.reject(new Error("grant-boom"));
+    };
+    try {
+      const res = await call(mcpInit(issued.access_token, "192.0.2.78"));
+      expectInitialized(res.status, await res.text());
+      const recorded = logs
+        .map((line) => {
+          try {
+            return JSON.parse(line) as { event?: string; error_class?: string };
+          } catch {
+            return null;
+          }
+        })
+        .filter((line) => line?.event === "grant_record");
+      expect(recorded.length).toBeGreaterThan(0);
+      expect(recorded.every((line) => line?.error_class === "Error" && !JSON.stringify(line).includes("grant-boom"))).toBe(true);
+    } finally {
+      BoxmcpQueue.prototype.rememberOwnerGrant = orig;
+      spy.mockRestore();
+    }
+  }, 30_000);
+
+  it("keeps scope and githubId across the code grant and the refresh grant", async () => {
     const issued = await issuedToken();
     expect(issued.scope).toBe("mcp offline_access");
     const grantId = issued.access_token.split(":")[1];
@@ -597,13 +755,14 @@ describe("grant recording and forge refunds", () => {
     expect(afterRefresh?.scope).toEqual(beforeRefresh?.scope);
     expect(afterRefresh?.encryptedProps).toBe(beforeRefresh?.encryptedProps);
 
-    seen.length = 0;
+    acceptedOwnerProps.githubId = undefined;
     const first = await call(mcpInit(issued.access_token, "192.0.2.60"));
     expectInitialized(first.status, await first.text());
+    expect(acceptedOwnerProps.githubId).toBe(12345);
+    acceptedOwnerProps.githubId = undefined;
     const second = await call(mcpInit(refreshed.access_token as string, "192.0.2.61"));
     expectInitialized(second.status, await second.text());
-    expect(seen).toEqual([12345, 12345]);
-    spy.mockRestore();
+    expect(acceptedOwnerProps.githubId).toBe(12345);
   }, 30_000);
 
   it("accepts a valid lowercase bearer", async () => {
@@ -622,65 +781,91 @@ describe("grant recording and forge refunds", () => {
     expect(statuses).toEqual([200, 200, 200]);
   }, 30_000);
 
-  it("charges a known grant with any secret to mcp:known, and refunds only the accepted owner", async () => {
+  it("does not let wrong secrets for a stored grant 429 the owner's own address", async () => {
+    await waitForFreshRateWindow();
     const issued = await issuedToken();
-    const grantId = issued.access_token.split(":")[1];
+    const token = issued.access_token;
+    const grantId = token.split(":")[1];
     const stub = queueStub(env as never);
-    const counts = () =>
-      runInDurableObject(stub, (inst: BoxmcpQueue) => {
-        const map = (inst as unknown as { buckets: Map<string, { count: number; resetAt: number }> }).buckets;
-        return { known: map.get("mcp:known")?.count ?? 0, forge: map.get("mcp:forge")?.count ?? 0 };
+    const ownerIp = "192.0.2.40";
+    const attackerIp = "198.51.100.40";
+    const seenOf = () =>
+      runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
+        return state.storage.sql.exec<{ seen_at: number }>(`SELECT seen_at FROM accepted_grants WHERE grant_id = ?`, grantId).one().seen_at;
       });
-    await runInDurableObject(stub, (inst: BoxmcpQueue, state) => {
+    const forgeCount = () =>
+      runInDurableObject(stub, (inst: BoxmcpQueue) => {
+        const map = (inst as unknown as { buckets: Map<string, { count: number }> }).buckets;
+        return { forge: map.get("mcp:forge")?.count ?? 0, known: map.has("mcp:known") };
+      });
+    await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
       state.storage.sql.exec(`UPDATE accepted_grants SET seen_at = 1000 WHERE grant_id = ?`, grantId);
-      const map = (inst as unknown as { buckets: Map<string, { count: number; resetAt: number }> }).buckets;
-      map.set("mcp:known", { count: 4, resetAt: Date.now() + 60_000 });
-      map.set("mcp:forge", { count: 1, resetAt: Date.now() + 60_000 });
     });
-    const ok = await call(mcpInit(issued.access_token, "192.0.2.71"));
-    expectInitialized(ok.status, await ok.text());
-    expect(await counts()).toEqual({ known: 4, forge: 1 });
-
-    const wrong = await call(new Request(`${BASE}/mcp`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer github-12345:${grantId}:${"z".repeat(32)}`,
-        host: "chief-bridge.test",
-        "content-type": "application/json",
-        "cf-connecting-ip": "192.0.2.72",
-      },
-      body: "{}",
-    }));
-    expect(wrong.status).toBe(401);
-    expect(await counts()).toEqual({ known: 5, forge: 1 });
-    const seen = await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
-      return state.storage.sql.exec<{ seen_at: number }>(`SELECT seen_at FROM accepted_grants WHERE grant_id = ?`, grantId).one().seen_at;
-    });
-    // The successful call above may have refreshed seen_at (the row was 1000, older than 60s).
-    // The wrong secret must not move it again.
-    const seenAfterWrong = seen;
-
-    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
-      const map = (inst as unknown as { buckets: Map<string, { count: number; resetAt: number }> }).buckets;
-      map.set("mcp:known", { count: MCP_KNOWN_PER_MIN, resetAt: Date.now() + 60_000 });
-    });
-    const blocked = await call(new Request(`${BASE}/mcp`, {
+    const seenBefore = await seenOf();
+    for (let i = 0; i < 8; i++) {
+      const wrong = await call(new Request(`${BASE}/mcp`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer github-12345:${grantId}:${"z".repeat(32)}`,
+          host: "chief-bridge.test",
+          "content-type": "application/json",
+          "cf-connecting-ip": attackerIp,
+        },
+        body: "{}",
+      }));
+      expect(wrong.status).toBe(401);
+    }
+    expect(await seenOf()).toBe(seenBefore);
+    expect(await forgeCount()).toEqual({ forge: 0, known: false });
+    const attackerBlocked = await call(new Request(`${BASE}/mcp`, {
       method: "POST",
       headers: {
         authorization: `Bearer github-12345:${grantId}:${"y".repeat(32)}`,
         host: "chief-bridge.test",
         "content-type": "application/json",
-        "cf-connecting-ip": "192.0.2.73",
+        "cf-connecting-ip": attackerIp,
       },
       body: "{}",
     }));
-    expect(blocked.status).toBe(429);
-    expect(blocked.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
-    expect(await counts()).toEqual({ known: MCP_KNOWN_PER_MIN, forge: 1 });
-    const seenBlocked = await runInDurableObject(stub, (_inst: BoxmcpQueue, state) => {
-      return state.storage.sql.exec<{ seen_at: number }>(`SELECT seen_at FROM accepted_grants WHERE grant_id = ?`, grantId).one().seen_at;
+    expect(attackerBlocked.status).toBe(429);
+    const owner = await call(mcpInit(token, ownerIp));
+    expectInitialized(owner.status, await owner.text());
+
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      const view = inst as unknown as { buckets: Map<string, { count: number; resetAt: number }>; forgeTrickleAt: number };
+      view.buckets.set("mcp:forge", { count: MCP_FORGE_PER_MIN, resetAt: Date.now() + 60_000 });
+      view.forgeTrickleAt = Date.now() + 3_600_000;
     });
-    expect(seenBlocked).toBe(seenAfterWrong);
+    const unknown = await call(new Request(`${BASE}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer github-12345:${"u".repeat(16)}:${"s".repeat(32)}`,
+        host: "chief-bridge.test",
+        "content-type": "application/json",
+        "cf-connecting-ip": "198.51.100.41",
+      },
+      body: "{}",
+    }));
+    expect(unknown.status).toBe(429);
+    const ownerStill = await call(mcpInit(token, ownerIp));
+    expectInitialized(ownerStill.status, await ownerStill.text());
+
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      (inst as unknown as { forgeTrickleAt: number }).forgeTrickleAt = 0;
+    });
+    const trickled = await call(new Request(`${BASE}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer github-12345:${"v".repeat(16)}:${"s".repeat(32)}`,
+        host: "chief-bridge.test",
+        "content-type": "application/json",
+        "cf-connecting-ip": "198.51.100.42",
+      },
+      body: "{}",
+    }));
+    expect(trickled.status).toBe(401);
+    const ownerAfterTrickle = await call(mcpInit(token, ownerIp));
+    expectInitialized(ownerAfterTrickle.status, await ownerAfterTrickle.text());
   }, 30_000);
 
   it("refunds a worker forge lookup only in its own window, and a trickle success does not lower the cap", async () => {

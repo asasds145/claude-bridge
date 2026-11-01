@@ -50,6 +50,62 @@ export async function sha256Hex(s: string): Promise<string> {
   return [...h].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function ipv4Key(s: string): string | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s);
+  if (!m) return null;
+  const parts = m.slice(1).map((p) => Number(p));
+  if (parts.some((n) => !Number.isInteger(n) || n > 255)) return null;
+  return parts.join(".");
+}
+
+/** Expand an IPv6 address to 8 groups, or null when it is not one. */
+function expandIpv6(text: string): number[] | null {
+  if (text.includes(":::")) return null;
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  const parseSide = (side: string): number[] | null => {
+    if (!side) return [];
+    const parts = side.split(":");
+    if (parts.some((p) => !/^[0-9a-f]{1,4}$/.test(p))) return null;
+    return parts.map((p) => Number.parseInt(p, 16));
+  };
+  if (halves.length === 1) {
+    const groups = parseSide(halves[0]);
+    if (!groups || groups.length !== 8) return null;
+    return groups;
+  }
+  const left = parseSide(halves[0]);
+  const right = parseSide(halves[1]);
+  if (!left || !right || left.length + right.length > 7) return null;
+  return [...left, ...Array(8 - left.length - right.length).fill(0), ...right];
+}
+
+/**
+ * What we hash for the IP limiter. IPv4 uses the whole address. IPv6 uses the /64,
+ * so a client cannot mint a new budget by rotating the host bits. An IPv4-mapped
+ * IPv6 address uses the embedded IPv4 address. Unparseable input is kept distinct.
+ */
+export function ipRateLimitMaterial(ip: string): string {
+  let text = ip.trim().toLowerCase();
+  const zone = text.indexOf("%");
+  if (zone >= 0) text = text.slice(0, zone);
+  const v4 = ipv4Key(text);
+  if (v4) return `4:${v4}`;
+  const dotted = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(text);
+  let embedded: string | null = null;
+  if (dotted) {
+    embedded = ipv4Key(dotted[2]);
+    if (!embedded) return `raw:${text}`;
+    const [a, b, c, d] = embedded.split(".").map(Number);
+    text = `${dotted[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const groups = text.includes(":") ? expandIpv6(text) : null;
+  if (!groups) return `raw:${text}`;
+  // ::ffff:0:0/96 carries an IPv4 address in the last 32 bits.
+  if (embedded && groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) return `4:${embedded}`;
+  return `6:${groups.slice(0, 4).map((g) => g.toString(16)).join(":")}`;
+}
+
 export class HttpError extends Error {
   constructor(public status: number, message: string) {
     super(message);
