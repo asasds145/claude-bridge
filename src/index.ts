@@ -55,22 +55,23 @@ function getProvider(origin: string): OAuthProvider<Env> {
     // Rate-limit by that validated user id. Do not key buckets by the raw header.
     apiHandler: {
       fetch: async (req, env, ctx) => {
-        // The provider only calls this after it accepts the access token. Remember it so a later
-        // forged flood cannot 429 this same token.
-        const presented = bearerToken(req);
-        if (presented) await queueStub(env).noteValidMcpToken(await tokenFingerprint(presented));
-        const userId = mcpActorId(ctx as ExecutionContext & { auth?: { userId?: string }; props?: { githubId?: number } });
+        const origin = new URL(req.url).origin;
+        // The provider only calls this after KV accepts the token. Remember the grant only if it is the current owner.
+        const presented = providerBearer(req.headers.get("authorization"));
+        const grantId = presented ? ownerGrantId(presented, env) : null;
         if (!validOwnerId(env.BOXMCP_OWNER_GITHUB_ID)) {
           logLine("mcp_auth", { status: 401, code: "bad_owner_id" });
-          return mcpUnauthorized(new URL(req.url).origin);
+          return markAuth(mcpUnauthorized(origin), "mismatch");
         }
+        const userId = mcpActorId(ctx as ExecutionContext & { auth?: { userId?: string }; props?: { githubId?: number } });
         if (!mcpUserMatchesOwner(userId, env.BOXMCP_OWNER_GITHUB_ID)) {
           logLine("mcp_auth", { status: 401, code: "owner_mismatch" });
-          return mcpUnauthorized(new URL(req.url).origin);
+          return markAuth(mcpUnauthorized(origin), "mismatch");
         }
+        if (grantId) await queueStub(env).rememberOwnerGrant(grantId);
         const rl = await queueStub(env).rateLimit(`mcp:${userId}`, MCP_RATE_PER_MIN, 60_000);
-        if (!rl.ok) return json({ error: "rate_limited" }, 429, { "retry-after": String(rl.retryAfter) });
-        return mcp(req, env, ctx);
+        if (!rl.ok) return markAuth(mcpLimited(origin, rl.retryAfter), "owner");
+        return markAuth(await mcp(req, env, ctx), "owner");
       },
     },
     defaultHandler,
@@ -116,53 +117,76 @@ export default {
       if (!rl.ok) return json({ error: "rate_limited" }, 429, { "retry-after": String(rl.retryAfter) });
     }
 
+    // workers-oauth-provider 1.2.4 matchApiRoute: exact "/mcp" or a descendant "/mcp/...". "/mcpx" is not an API route.
     const mcpPath = path === "/mcp" || path.startsWith("/mcp/");
-    const token = bearerToken(req);
-    const shaped = mcpPath && ownerShapedBearer(req, env);
-    let forgeFp: string | null = null;
-    let forgeAdmit: "known" | "allow" | "deny" | null = null;
-    if (mcpPath && token && !shaped) {
-      // Random Authorization values share one bucket. No header is not charged: that 401 is cheap.
-      const rl = await queueStub(env).rateLimit("mcp:unauth", MCP_PREAUTH_PER_MIN, 60_000);
-      if (!rl.ok) return json({ error: "rate_limited" }, 429, { "retry-after": String(rl.retryAfter) });
-    } else if (shaped && token) {
-      forgeFp = await tokenFingerprint(token);
-      forgeAdmit = await queueStub(env).mcpForgeAdmit(forgeFp, MCP_FORGE_PER_MIN);
-      if (forgeAdmit === "deny") {
-        logLine("req", { route: routeLabel(path), status: 429 });
-        return json({ error: "rate_limited" }, 429, { "retry-after": "60" });
+    let forgeRefundable = false;
+    if (mcpPath) {
+      const cls = classifyMcpAuth(req, env);
+      if (cls.kind === "unauth") {
+        const rl = await queueStub(env).rateLimit("mcp:unauth", MCP_PREAUTH_PER_MIN, 60_000);
+        if (!rl.ok) {
+          logLine("req", { route: routeLabel(path), status: 429 });
+          return mcpLimited(o.origin, rl.retryAfter);
+        }
+      } else if (cls.kind === "forge") {
+        // One DO call reserves the slot before KV. A known owner grant skips the budget.
+        const slot = await queueStub(env).reserveForge(cls.grantId, MCP_FORGE_PER_MIN, 60_000);
+        if (slot.action === "deny") {
+          logLine("req", { route: routeLabel(path), status: 429 });
+          return mcpLimited(o.origin, slot.retryAfter);
+        }
+        if (slot.action === "reserved") forgeRefundable = slot.refundable;
       }
     }
 
-    const res = await getProvider(o.origin).fetch(req, env, ctx);
-    // Charge the forge budget only when the provider rejects an owner-shaped token.
-    // A token it accepts is remembered in apiHandler and is not counted here.
-    if (forgeFp && forgeAdmit === "allow" && res.status === 401) {
-      await queueStub(env).rateLimit("mcp:forge", MCP_FORGE_PER_MIN, 60_000);
-    }
+    const raw = await getProvider(o.origin).fetch(req, env, ctx);
+    const { res, mark } = stripAuthMark(raw);
+    // Provider accepted the token (current owner or a previous owner). Do not keep the forge charge.
+    // A forged token never reaches apiHandler, so its reservation stays consumed.
+    if (forgeRefundable && (mark === "owner" || mark === "mismatch")) await queueStub(env).releaseForge();
     logLine("req", { route: routeLabel(path), status: res.status });
     return res;
   },
 } satisfies ExportedHandler<Env>;
 
-/** Bearer challenge matching the provider's 401s, so Claude.ai starts a new login. */
-function mcpUnauthorized(origin: string): Response {
+/** Same challenge shape as workers-oauth-provider buildWwwAuthenticateHeader (realm, resource_metadata, scope). */
+function oauthChallenge(origin: string, error?: "invalid_token"): string {
   const metadata = `${origin}/.well-known/oauth-protected-resource/mcp`;
-  return json({ error: "unauthorized" }, 401, {
-    "www-authenticate": `Bearer realm="OAuth", error="invalid_token", scope="mcp", resource_metadata="${metadata}"`,
+  const base = `Bearer realm="OAuth", resource_metadata="${metadata}", scope="mcp"`;
+  return error ? `${base}, error="${error}"` : base;
+}
+
+function mcpUnauthorized(origin: string): Response {
+  return json({ error: "unauthorized" }, 401, { "www-authenticate": oauthChallenge(origin, "invalid_token") });
+}
+
+function mcpLimited(origin: string, retryAfter: number): Response {
+  return json({ error: "rate_limited" }, 429, {
+    "retry-after": String(Math.max(1, retryAfter)),
+    "www-authenticate": oauthChallenge(origin),
   });
 }
 
-function bearerToken(req: Request): string | null {
-  const m = /^Bearer\s+(\S+)$/i.exec(req.headers.get("authorization") ?? "");
-  return m ? m[1] : null;
+const AUTH_MARK = "x-chief-auth";
+
+function markAuth(res: Response, mark: "owner" | "mismatch"): Response {
+  const headers = new Headers(res.headers);
+  headers.set(AUTH_MARK, mark);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
-/** Library access tokens are `userId:grantId:secret` with userId `github-<digits>`. */
-function tokenUserHint(token: string): string | null {
-  const parts = token.split(":");
-  if (parts.length !== 3 || !/^github-\d+$/.test(parts[0]) || parts[1].length === 0 || parts[2].length === 0) return null;
-  return parts[0];
+function stripAuthMark(res: Response): { res: Response; mark: string | null } {
+  const mark = res.headers.get(AUTH_MARK);
+  if (!mark) return { res, mark: null };
+  const headers = new Headers(res.headers);
+  headers.delete(AUTH_MARK);
+  return { res: new Response(res.body, { status: res.status, statusText: res.statusText, headers }), mark };
+}
+
+/** Provider 1.2.4 handleApiRequest: `^Bearer[\\t ]+([^\\s,]+)$`. Anything else is not a token lookup. */
+function providerBearer(header: string | null): string | null {
+  if (!header) return null;
+  return /^Bearer[\t ]+([^\s,]+)$/i.exec(header)?.[1] ?? null;
 }
 
 function expectedOwnerUser(env: Env): string | null {
@@ -170,12 +194,23 @@ function expectedOwnerUser(env: Env): string | null {
   return owner ? `github-${owner}` : null;
 }
 
-async function tokenFingerprint(token: string): Promise<string> {
-  return (await sha256Hex(token)).slice(0, 32);
+/** Middle segment of an owner-shaped token, or null. userId is `github-<id>` and contains no colon. */
+function ownerGrantId(token: string, env: Env): string | null {
+  const owner = expectedOwnerUser(env);
+  if (!owner) return null;
+  const parts = token.split(":");
+  if (parts.length !== 3 || parts[0] !== owner || parts[1].length === 0 || parts[2].length === 0) return null;
+  return parts[1];
 }
 
-function ownerShapedBearer(req: Request, env: Env): boolean {
-  const token = bearerToken(req);
-  const owner = expectedOwnerUser(env);
-  return token !== null && owner !== null && tokenUserHint(token) === owner;
+type McpAuthClass = { kind: "none" } | { kind: "unauth" } | { kind: "forge"; grantId: string };
+
+function classifyMcpAuth(req: Request, env: Env): McpAuthClass {
+  const header = req.headers.get("authorization");
+  // Absent header: provider returns 401 before KV. Do not charge.
+  if (header === null) return { kind: "none" };
+  const token = providerBearer(header);
+  const grantId = token ? ownerGrantId(token, env) : null;
+  if (!grantId) return { kind: "unauth" };
+  return { kind: "forge", grantId };
 }

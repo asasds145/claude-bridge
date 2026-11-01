@@ -5,6 +5,7 @@ import { CLAUDE_REDIRECT_URI } from "../src/auth-github";
 import { queueStub } from "../src/env";
 import worker, { MCP_FORGE_PER_MIN, MCP_PREAUTH_PER_MIN, MCP_RATE_PER_MIN } from "../src/index";
 import type { BoxmcpQueue } from "../src/queue";
+import { resetSharedDurableState } from "./isolate";
 
 // 테스트 전용 가짜 값 (실제 secret/토큰 아님)
 const BASE = "https://chief-bridge.test";
@@ -13,14 +14,7 @@ const E = { ...(env as object), GITHUB_CLIENT_SECRET: "fake-github-secret-for-te
 
 afterEach(() => vi.restoreAllMocks());
 
-beforeEach(async () => {
-  // These counters live on the shared Durable Object and would otherwise leak between tests.
-  await runInDurableObject(queueStub(env as never), (inst: BoxmcpQueue) => {
-    const buckets = (inst as unknown as { buckets: Map<string, unknown> }).buckets;
-    buckets.delete("mcp:unauth");
-    buckets.delete("mcp:forge");
-  });
-});
+beforeEach(() => resetSharedDurableState());
 
 /** 브라우저 쿠키 흉내: __Host- 규칙(Secure, Path=/, Domain 없음), Max-Age=0 삭제, SameSite=Lax(top-level GET·same-site POST 전송) */
 class Jar {
@@ -226,7 +220,7 @@ function mcpInit(token: string): Request {
   });
 }
 
-async function exchange(code: string): Promise<string> {
+async function exchange(code: string): Promise<{ access_token: string; refresh_token: string }> {
   const res = await call(new Request(`${BASE}/oauth/token`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -241,9 +235,27 @@ async function exchange(code: string): Promise<string> {
   }));
   const text = await res.text();
   expect(res.status, text).toBe(200);
-  const token = (JSON.parse(text) as { access_token?: string }).access_token;
-  expect(token).toBeTruthy();
-  return token as string;
+  const body = JSON.parse(text) as { access_token?: string; refresh_token?: string };
+  expect(body.access_token).toBeTruthy();
+  expect(body.refresh_token).toBeTruthy();
+  return { access_token: body.access_token as string, refresh_token: body.refresh_token as string };
+}
+
+async function refresh(refreshToken: string): Promise<string> {
+  const res = await call(new Request(`${BASE}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+      client_id: CIMD_ID,
+    }),
+  }));
+  const text = await res.text();
+  expect(res.status, text).toBe(200);
+  const access = (JSON.parse(text) as { access_token?: string }).access_token;
+  expect(access).toBeTruthy();
+  return access as string;
 }
 
 function parseMcp(body: string): { error?: unknown; result?: { protocolVersion?: string; serverInfo?: { name?: string; version?: string } } } {
@@ -265,9 +277,11 @@ describe("authenticated /mcp", () => {
     const loc = new URL(c.headers.get("location")!);
     const code = loc.searchParams.get("code");
     expect(code).toBeTruthy();
-    const token = await exchange(code as string);
+    const issued = await exchange(code as string);
+    const token = issued.access_token;
     const ok = await call(mcpInit(token));
     expectInitialized(ok.status, await ok.text());
+    expect(ok.headers.get("x-chief-auth")).toBeNull();
 
     const stub = queueStub(env as never);
     const bucketMap = (inst: BoxmcpQueue) => (inst as unknown as { buckets: Map<string, { count: number; resetAt: number }> }).buckets;
@@ -313,8 +327,45 @@ describe("authenticated /mcp", () => {
       body: "{}",
     }));
     expect(forgedAgain.status).toBe(429);
+    expect(forgedAgain.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
+    const retryAfter = Number(forgedAgain.headers.get("retry-after"));
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(retryAfter).toBeLessThanOrEqual(60);
     const ownerStill = await call(mcpInit(token));
     expectInitialized(ownerStill.status, await ownerStill.text());
+
+    const refreshed = await refresh(issued.refresh_token);
+    expect(refreshed.split(":")[1]).toBe(token.split(":")[1]);
+    const refreshedCall = await call(mcpInit(refreshed));
+    expectInitialized(refreshedCall.status, await refreshedCall.text());
+
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      const map = bucketMap(inst);
+      map.clear();
+      map.set("mcp:forge", { count: MCP_FORGE_PER_MIN, resetAt: Date.now() + 60_000 });
+      (inst as unknown as { forgeTrickleAt: number }).forgeTrickleAt = Date.now();
+    });
+    const afterRestart = await call(mcpInit(refreshed));
+    expectInitialized(afterRestart.status, await afterRestart.text());
+
+    const grantId = token.split(":")[1];
+    await runInDurableObject(stub, async (inst: BoxmcpQueue) => {
+      for (let i = 0; i < 40; i++) await inst.rememberOwnerGrant(("g" + i.toString().padStart(15, "0")).slice(0, 16));
+      await inst.rememberOwnerGrant(grantId);
+      bucketMap(inst).set("mcp:forge", { count: MCP_FORGE_PER_MIN, resetAt: Date.now() + 60_000 });
+      (inst as unknown as { forgeTrickleAt: number }).forgeTrickleAt = Date.now();
+    });
+    const afterMany = await call(mcpInit(refreshed));
+    expectInitialized(afterMany.status, await afterMany.text());
+
+    // Unknown grant, budget full: the trickle lookup still returns the real response, not a forge 429.
+    await runInDurableObject(stub, (inst: BoxmcpQueue, state) => {
+      state.storage.sql.exec(`DELETE FROM accepted_grants`);
+      bucketMap(inst).set("mcp:forge", { count: MCP_FORGE_PER_MIN, resetAt: Date.now() + 60_000 });
+      (inst as unknown as { forgeTrickleAt: number }).forgeTrickleAt = 0;
+    });
+    const trickled = await call(mcpInit(refreshed));
+    expectInitialized(trickled.status, await trickled.text());
     await runInDurableObject(stub, (inst: BoxmcpQueue) => {
       bucketMap(inst).delete("mcp:forge");
     });
@@ -331,11 +382,15 @@ describe("authenticated /mcp", () => {
       (inst as unknown as { buckets: Map<string, unknown> }).buckets.delete("mcp:github-12345");
     });
     const statuses: number[] = [];
+    let lastLimited: Response | undefined;
     for (let i = 0; i < MCP_RATE_PER_MIN + 1; i++) {
-      statuses.push((await call(mcpInit(token))).status);
+      lastLimited = await call(mcpInit(token));
+      statuses.push(lastLimited.status);
     }
     expect(statuses.slice(0, MCP_RATE_PER_MIN).every((s) => s === 200)).toBe(true);
     expect(statuses[MCP_RATE_PER_MIN]).toBe(429);
+    expect(lastLimited?.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
+    expect(Number(lastLimited?.headers.get("retry-after"))).toBeGreaterThan(0);
   }, 30_000);
 });
 

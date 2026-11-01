@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { queueStub } from "../src/env";
 import { WEBHOOK_DEBOUNCE_MS, WEBHOOK_MIN_GAP_MS, webhookBlockReason, type BoxmcpQueue } from "../src/queue";
+import { resetSharedDurableState } from "./isolate";
 
 const E = env as unknown as Env;
 type Call = { url: string; body: string; auth: string | null; redirect: string | null };
@@ -36,6 +37,7 @@ function mockFetch(impl: () => Promise<Response> | Response) {
 }
 
 beforeEach(async () => {
+  await resetSharedDurableState();
   calls = [];
   // 테스트 전용 가짜 webhook 설정 (실제 URL/secret 아님) + 깨끗한 webhook 상태
   await runInDurableObject(queueStub(E), (inst: BoxmcpQueue, state) => {

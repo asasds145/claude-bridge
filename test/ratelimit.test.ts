@@ -2,20 +2,16 @@ import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 import { queueStub } from "../src/env";
+import { MCP_FORGE_PER_MIN, MCP_PREAUTH_PER_MIN } from "../src/index";
 import { MAX_PUBLIC_BUCKETS, type BoxmcpQueue } from "../src/queue";
+import { resetSharedDurableState } from "./isolate";
 
 const KEY = "test-chief-key-not-a-secret";
 type Buckets = Map<string, { count: number; resetAt: number }>;
 const trustedOf = (inst: BoxmcpQueue) => (inst as unknown as { buckets: Buckets }).buckets;
 const publicOf = (inst: BoxmcpQueue) => (inst as unknown as { publicBuckets: Buckets }).publicBuckets;
 
-beforeEach(async () => {
-  await runInDurableObject(queueStub(env as never), (inst: BoxmcpQueue) => {
-    const buckets = (inst as unknown as { buckets: Map<string, unknown> }).buckets;
-    buckets.delete("mcp:unauth");
-    buckets.delete("mcp:forge");
-  });
-});
+beforeEach(() => resetSharedDurableState());
 
 describe("rate limit", () => {
   it("/chief 60/min → 61st is 429", async () => {
@@ -65,6 +61,68 @@ describe("rate limit", () => {
     for (const k of added) {
       expect(k).not.toContain("not-a-token");
     }
+  });
+
+  it("parallel forged owner-shaped tokens cannot exceed the forge cap", async () => {
+    const extra = 25;
+    const responses = await Promise.all(
+      Array.from({ length: MCP_FORGE_PER_MIN + extra }, (_, i) => {
+        const grant = ("f" + i.toString().padStart(15, "0")).slice(0, 16);
+        return exports.default.fetch(
+          new Request("https://chief-bridge.test/mcp", {
+            method: "POST",
+            headers: {
+              authorization: `Bearer github-12345:${grant}:${"s".repeat(32)}`,
+              "content-type": "application/json",
+            },
+            body: "{}",
+          }),
+        );
+      }),
+    );
+    const statuses = await Promise.all(responses.map((r) => r.status));
+    const lookups = statuses.filter((s) => s === 401).length;
+    const blocked = statuses.filter((s) => s === 429).length;
+    expect(lookups).toBe(MCP_FORGE_PER_MIN);
+    expect(blocked).toBe(extra);
+    const limited = responses.find((r) => r.status === 429);
+    expect(limited?.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
+    expect(Number(limited?.headers.get("retry-after"))).toBeGreaterThan(0);
+  });
+
+  it("charges malformed Authorization and /mcp descendants, not a non-API path", async () => {
+    const stub = queueStub(env as never);
+    await runInDurableObject(stub, (inst: BoxmcpQueue) => {
+      const buckets = (inst as unknown as { buckets: Map<string, { count: number; resetAt: number }> }).buckets;
+      const full = { count: MCP_PREAUTH_PER_MIN, resetAt: Date.now() + 60_000 };
+      buckets.set("mcp:unauth", full);
+      buckets.set("mcp:forge", { count: MCP_FORGE_PER_MIN, resetAt: Date.now() + 60_000 });
+      (inst as unknown as { forgeTrickleAt: number }).forgeTrickleAt = Date.now();
+    });
+    const base = "https://chief-bridge.test";
+    const post = (path: string, authorization?: string) =>
+      exports.default.fetch(
+        new Request(base + path, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            ...(authorization ? { authorization } : {}),
+          },
+          body: "{}",
+        }),
+      );
+    const spaced = await post("/mcp", "Bearer a:b:c d");
+    expect(spaced.status).toBe(429);
+    expect(spaced.headers.get("www-authenticate") ?? "").toContain(`resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"`);
+    expect(Number(spaced.headers.get("retry-after"))).toBeGreaterThan(0);
+    const child = await post("/mcp/extra", "Bearer not-a-token");
+    expect(child.status).toBe(429);
+    const bare = await post("/mcp");
+    expect(bare.status).toBe(401);
+    expect(bare.headers.get("www-authenticate") ?? "").toContain("resource_metadata=");
+    // matchApiRoute does not treat /mcpx as /mcp, so this is not a token lookup.
+    const notApi = await post("/mcpx", `Bearer github-12345:${"a".repeat(16)}:${"b".repeat(32)}`);
+    expect(notApi.status).not.toBe(429);
   });
 
   it("a full public map does not refuse trusted keys, and expired public keys are reclaimed", async () => {

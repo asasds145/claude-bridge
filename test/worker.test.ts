@@ -1,5 +1,6 @@
 import { env, exports } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
+import { resetSharedDurableState } from "./isolate";
 import type { Env } from "../src/env";
 import { queueStub } from "../src/env";
 import { wrapForClaude } from "../src/util";
@@ -11,6 +12,8 @@ const KEY = "test-chief-key-not-a-secret";
 const fetchW = (path: string, init?: RequestInit) => exports.default.fetch(new Request(BASE + path, init));
 const chief = (path: string, init: RequestInit = {}) =>
   fetchW(path, { ...init, headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json", ...(init.headers ?? {}) } });
+
+beforeEach(() => resetSharedDurableState());
 
 describe("/chief auth", () => {
   it("no key → 401", async () => {

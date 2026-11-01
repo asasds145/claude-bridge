@@ -21,7 +21,18 @@ export const MAX_WAITERS = 10;
 export const MAX_PUBLIC_BUCKETS = 256;
 /** Registration is one bucket per hash shard, not per raw address. 2 hex chars = 256 shards. */
 export const REGISTER_SHARD_HEX = 2;
+/** Library grant ids are 16 characters from this alphabet (workers-oauth-provider 1.2.4). */
+export const ACCEPTED_GRANT_RE = /^[A-Za-z0-9_-]{16}$/;
+/** Owner grants only. Attackers cannot insert rows. Oldest rows past this cap are dropped. */
+export const MAX_ACCEPTED_GRANTS = 32;
+/** When mcp:forge is full, one unknown owner-shaped token may still be looked up this often. */
+export const FORGE_TRICKLE_MS = 5_000;
 const HOUR = 3600 * 1000;
+
+export type ForgeReservation =
+  | { action: "known"; retryAfter: 0 }
+  | { action: "reserved"; refundable: boolean; retryAfter: number }
+  | { action: "deny"; retryAfter: number };
 
 export type WebhookBlockReason = "non_https" | "invalid_url" | "missing_key";
 
@@ -68,8 +79,8 @@ export class BoxmcpQueue extends DurableObject<Env> {
   private waiters = new Set<Waiter>();
   /** Server-chosen keys only: chief, send_to_chief, mcp user, shared unauth/forge buckets. */
   private buckets = new Map<string, { count: number; resetAt: number }>();
-  /** Fingerprints of access tokens the provider has already accepted. Fixed size, not one per attacker. */
-  private validTokenFps: string[] = [];
+  /** Last time an over-cap forge lookup was admitted. In-memory; the accepted-grant table is what survives eviction. */
+  private forgeTrickleAt = Date.now();
   /** Keys an unauthenticated caller can multiply (registration shards). Capped separately. */
   private publicBuckets = new Map<string, { count: number; resetAt: number }>();
 
@@ -88,6 +99,8 @@ export class BoxmcpQueue extends DurableObject<Env> {
       this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_thread ON messages(thread_id, id)`);
       this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_dir ON messages(direction, acked, id)`);
       this.sql.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`);
+      // Grant ids the owner check has accepted. A refresh keeps the same grant id, so one row covers every access token for that login.
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS accepted_grants (grant_id TEXT PRIMARY KEY, seen_at INTEGER NOT NULL)`);
       if (this.getMeta("cleanup_due") === null) {
         this.setMeta("cleanup_due", String(Date.now() + CLEANUP_INTERVAL_MS));
       }
@@ -126,22 +139,55 @@ export class BoxmcpQueue extends DurableObject<Env> {
   }
 
   /**
-   * Owner-shaped bearers that this isolate has not accepted yet.
-   * `known` skips the failure budget (a real token already worked).
-   * `deny` means forged lookups have filled the budget: do not call the provider.
-   * `allow` means the caller may look the token up, and should charge mcp:forge only if that lookup fails.
+   * Serialized by the Durable Object input gate, so a parallel burst cannot reserve more than `limit` lookups.
+   * A grant the owner check already accepted skips the budget entirely.
    */
-  async mcpForgeAdmit(fp: string, limit: number): Promise<"known" | "allow" | "deny"> {
-    if (this.validTokenFps.includes(fp)) return "known";
-    const b = this.buckets.get("mcp:forge");
-    if (b && b.resetAt > Date.now() && b.count >= limit) return "deny";
-    return "allow";
+  async reserveForge(grantId: string, limit: number, windowMs: number): Promise<ForgeReservation> {
+    if (ACCEPTED_GRANT_RE.test(grantId) && this.ownerGrantKnown(grantId)) {
+      this.sql.exec(`UPDATE accepted_grants SET seen_at = ? WHERE grant_id = ?`, Date.now(), grantId);
+      return { action: "known", retryAfter: 0 };
+    }
+    const now = Date.now();
+    let b = this.buckets.get("mcp:forge");
+    if (!b || b.resetAt <= now) {
+      b = { count: 0, resetAt: now + windowMs };
+      this.buckets.set("mcp:forge", b);
+    }
+    const retryAfter = Math.max(1, Math.ceil((b.resetAt - now) / 1000));
+    if (b.count < limit) {
+      b.count++;
+      return { action: "reserved", refundable: true, retryAfter };
+    }
+    if (now - this.forgeTrickleAt >= FORGE_TRICKLE_MS) {
+      this.forgeTrickleAt = now;
+      return { action: "reserved", refundable: false, retryAfter };
+    }
+    return { action: "deny", retryAfter };
   }
 
-  async noteValidMcpToken(fp: string): Promise<void> {
-    this.validTokenFps = this.validTokenFps.filter((x) => x !== fp);
-    this.validTokenFps.push(fp);
-    if (this.validTokenFps.length > 8) this.validTokenFps.shift();
+  /** Give back a cap slot when the provider accepted the token (owner or owner-mismatch). Trickle slots are not counted. */
+  async releaseForge(): Promise<void> {
+    const b = this.buckets.get("mcp:forge");
+    if (b && b.count > 0) b.count--;
+  }
+
+  /** Record a grant only after the current-owner check. Bounds the table by dropping the oldest rows. */
+  async rememberOwnerGrant(grantId: string): Promise<void> {
+    if (!ACCEPTED_GRANT_RE.test(grantId)) return;
+    const now = Date.now();
+    this.sql.exec(
+      `INSERT INTO accepted_grants (grant_id, seen_at) VALUES (?, ?) ON CONFLICT(grant_id) DO UPDATE SET seen_at = excluded.seen_at`,
+      grantId,
+      now,
+    );
+    this.sql.exec(
+      `DELETE FROM accepted_grants WHERE grant_id NOT IN (SELECT grant_id FROM accepted_grants ORDER BY seen_at DESC LIMIT ?)`,
+      MAX_ACCEPTED_GRANTS,
+    );
+  }
+
+  private ownerGrantKnown(grantId: string): boolean {
+    return this.sql.exec(`SELECT 1 AS n FROM accepted_grants WHERE grant_id = ? LIMIT 1`, grantId).toArray().length > 0;
   }
 
   private limitIn(
@@ -166,7 +212,7 @@ export class BoxmcpQueue extends DurableObject<Env> {
       map.set(key, { count: 1, resetAt: now + windowMs });
       return { ok: true, retryAfter: 0 };
     }
-    if (existing.count >= limit) return { ok: false, retryAfter: Math.ceil((existing.resetAt - now) / 1000) };
+    if (existing.count >= limit) return { ok: false, retryAfter: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)) };
     existing.count++;
     return { ok: true, retryAfter: 0 };
   }

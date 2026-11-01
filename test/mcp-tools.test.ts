@@ -2,8 +2,9 @@
 import { createExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { createMcpHandler } from "agents/mcp/server";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { createServer } from "../src/mcp";
+import { resetSharedDurableState } from "./isolate";
 
 const handler = createMcpHandler(createServer, { route: "/mcp", allowedHostnames: ["chief-bridge.test"], corsOptions: false });
 let n = 0;
@@ -22,6 +23,8 @@ async function rpc(method: string, params: unknown) {
   return { status: res.status, json: JSON.parse(dataLine ? dataLine.slice(5) : body) };
 }
 const call = (name: string, args: unknown) => rpc("tools/call", { name, arguments: args });
+
+beforeEach(() => resetSharedDurableState());
 
 describe("MCP tools", () => {
   it("tools/list has the 5 tools with annotations", async () => {
